@@ -22,14 +22,14 @@ Output lands in `dist/BotWall.exe`. The spec bundles `CmCSAHz.ico` and `CmCSAHz.
 
 ## Architecture
 
-The entire application is a single file: `botwall.py` (~1080 lines).
+The entire application is a single file: `botwall.py` (~1300 lines).
 
 **Threading model:**
-- `Scanner(QThread)` — runs every 3 s, calls `win32gui.EnumWindows` to find visible windows whose titles contain "dreambot", "runescape", or "oldschool runescape". Caches `psutil.Process` objects by PID to get meaningful `cpu_percent()` readings across calls. Emits `updated` signal with a list of 6-tuples: `(hwnd, title, pid, proc_name, cpu_pct, mem_mb)`.
-- `Capturer(QThread)` — iterates the current hwnd list, calls `capture_hwnd()` per window, emits `captured(hwnd, QPixmap)`. Refresh rate is 250 ms (High CPU) or 1000 ms (Low CPU).
+- `Scanner(QThread)` — runs every 3 s, calls `win32gui.EnumWindows` to find visible windows whose titles contain "dreambot" or "runescape" AND whose owning process looks like a bot client (`_is_bot_process`: java/javaw or dreambot/runelite/osclient/jagex in the name) — this keeps browser tabs mentioning RuneScape out of the grid and out of KILL ALL's reach. Caches `psutil.Process` objects by PID; stats are memoized per PID per scan (one `cpu_percent()` call per process, normalized by `NUM_CORES`). Emits `updated` signal with a list of 6-tuples: `(hwnd, title, pid, proc_name, cpu_pct, mem_mb)`.
+- `Capturer(QThread)` — iterates the current hwnd list, calls `capture_hwnd()` per window, emits `captured(hwnd, QImage)` (QImage, not QPixmap — pixmaps are GUI-thread-only; conversion happens in `BotWall._on_capture`). Deadline-based pacing: the interval (250 ms High CPU / 1000 ms Low CPU) is the full cycle period. Pausable via `set_paused()`; BotWall pauses it while its own window is minimized, and shelf-minimized clients are excluded from the hwnd list (`_push_capture_hwnds`).
 
 **Window capture:**
-`capture_hwnd()` uses `ctypes.windll.user32.PrintWindow(hwnd, dc, 2)` (flag 2 = `PW_RENDERFULLCONTENT`) to capture hardware-accelerated windows. The GDI bitmap is read as raw BGRX bytes, converted via `PIL.Image.frombuffer("RGB", ..., "raw", "BGRX")`, then serialized through a PNG buffer into a `QPixmap`.
+`capture_hwnd()` uses `ctypes.windll.user32.PrintWindow(hwnd, dc, 2)` (flag 2 = `PW_RENDERFULLCONTENT`) to capture hardware-accelerated windows. The GDI bitmap's raw BGRX bytes are wrapped directly in a `QImage(..., Format_RGB32).copy()` — no PIL, no PNG round-trip. Iconic (OS-minimized) and hung windows are skipped (`IsIconic` / `IsHungAppWindow`). All GDI handles are released in a per-handle-guarded `finally`; the bitmap must be deselected from the DC before `DeleteObject`, and pywin32's bitmap wrapper does NOT free the handle in its destructor — the manual delete is required.
 
 **UI hierarchy:**
 ```
@@ -64,7 +64,8 @@ Sets capture interval to 1 s and converts each frame to grayscale (`QImage.Forma
 | `CAPTURE_INTERVAL_HIGH` | 250 ms | Frame rate, High CPU mode |
 | `CAPTURE_INTERVAL_LOW` | 1000 ms | Frame rate, Low CPU mode |
 | `CARD_W_DEFAULT` / `CARD_H_DEFAULT` | 320 / 220 | Initial card dimensions |
-| `KEYWORDS` | `("dreambot", "runescape", "oldschool runescape")` | Window title filter |
+| `KEYWORDS` | `("dreambot", "runescape")` | Window title filter |
+| `BOT_PROC_NAMES` / `BOT_PROC_KEYWORDS` | java/javaw exact; dreambot/runelite/osclient/jagex substring | Process-name filter (guards KILL ALL) |
 
 ## Platform Notes
 

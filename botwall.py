@@ -1,28 +1,28 @@
 """
 BotWall — live screenshot monitor for DreamBot / RuneScape clients.
-Requires: PyQt5, pywin32, psutil, Pillow
+Requires: PyQt5, pywin32, psutil (Python 3.10+)
 """
+
+from __future__ import annotations
 
 import sys
 import time
 import ctypes
-import io
 
 import psutil
 import win32gui
 import win32ui
 import win32process
 import win32con
-from PIL import Image
 
 from PyQt5.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QUrl
+    Qt, QThread, pyqtSignal, QTimer, QUrl, QEvent
 )
-from PyQt5.QtGui import QPixmap, QImage, QFont, QColor, QPainter, QCursor, QIcon, QDesktopServices
+from PyQt5.QtGui import QPixmap, QImage, QColor, QCursor, QIcon, QDesktopServices
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QScrollArea, QGridLayout, QVBoxLayout, QHBoxLayout, QFrame,
-    QSizePolicy, QMessageBox, QToolBar, QComboBox, QMenu
+    QSizePolicy, QMessageBox, QComboBox, QMenu
 )
 
 # ---------------------------------------------------------------------------
@@ -46,7 +46,15 @@ DIM_COLOR       = "#607080"
 ACCENT_TEAL     = "#3dc8d8"
 ACCENT_RED      = "#df4545"
 
-KEYWORDS = ("dreambot", "runescape", "oldschool runescape")
+KEYWORDS = ("dreambot", "runescape")
+
+# A window only counts as a client if its process also looks like one.
+# Without this, a browser tab titled "RuneScape Wiki" gets a card — and
+# gets its process terminated by KILL ALL.
+BOT_PROC_NAMES    = ("java.exe", "javaw.exe")
+BOT_PROC_KEYWORDS = ("dreambot", "runelite", "osclient", "jagex")
+
+NUM_CORES = psutil.cpu_count() or 1
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -63,9 +71,25 @@ def _is_dreambot41(title: str) -> bool:
     return "dreambot" in tl and "4.1" in tl
 
 
-def capture_hwnd(hwnd: int) -> QPixmap | None:
-    """Capture a window via PrintWindow → PIL → QPixmap. Returns None on failure."""
+def _is_bot_process(proc_name: str) -> bool:
+    nl = proc_name.lower()
+    return nl in BOT_PROC_NAMES or any(kw in nl for kw in BOT_PROC_KEYWORDS)
+
+
+def capture_hwnd(hwnd: int) -> QImage | None:
+    """Capture a window via PrintWindow into a QImage. Returns None on failure.
+
+    Returns QImage (not QPixmap) because this runs on the Capturer thread and
+    QPixmap is GUI-thread-only.
+    """
+    qimg = None
+    hwnd_dc = mfc_dc = save_dc = bitmap = old_bmp = None
     try:
+        if win32gui.IsIconic(hwnd):
+            return None  # minimized windows render as a useless titlebar sliver
+        if ctypes.windll.user32.IsHungAppWindow(hwnd):
+            return None  # PrintWindow would block on a hung window's message queue
+
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         w = right - left
         h = bottom - top
@@ -73,42 +97,56 @@ def capture_hwnd(hwnd: int) -> QPixmap | None:
             return None
 
         hwnd_dc = win32gui.GetWindowDC(hwnd)
+        if not hwnd_dc:
+            return None
         mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
         save_dc = mfc_dc.CreateCompatibleDC()
         bitmap  = win32ui.CreateBitmap()
         bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
-        save_dc.SelectObject(bitmap)
+        old_bmp = save_dc.SelectObject(bitmap)
 
         # PW_RENDERFULLCONTENT = 2 — captures layered/hardware-accelerated content
         result = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
-
-        bmp_info = bitmap.GetInfo()
-        bmp_str  = bitmap.GetBitmapBits(True)
-
-        img = Image.frombuffer(
-            "RGB",
-            (bmp_info["bmWidth"], bmp_info["bmHeight"]),
-            bmp_str, "raw", "BGRX", 0, 1
-        )
-
-        # Cleanup GDI objects
-        win32gui.DeleteObject(bitmap.GetHandle())
-        save_dc.DeleteDC()
-        mfc_dc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hwnd_dc)
-
-        if result == 0:
-            return None  # PrintWindow failed
-
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        qimg = QImage()
-        qimg.loadFromData(buf.read())
-        return QPixmap.fromImage(qimg)
-
+        if result != 0:
+            bmp_info = bitmap.GetInfo()
+            bmp_str  = bitmap.GetBitmapBits(True)
+            # GDI hands back BGRX rows, which is exactly Format_RGB32.
+            # .copy() detaches from bmp_str before the GDI objects are freed.
+            qimg = QImage(
+                bmp_str, bmp_info["bmWidth"], bmp_info["bmHeight"],
+                bmp_info["bmWidthBytes"], QImage.Format_RGB32
+            ).copy()
     except Exception:
-        return None
+        qimg = None
+    finally:
+        # Each step guarded so one failure can't leak the remaining handles.
+        # The bitmap must be deselected from the DC or DeleteObject fails.
+        if old_bmp is not None:
+            try:
+                save_dc.SelectObject(old_bmp)
+            except Exception:
+                pass
+        if bitmap is not None:
+            try:
+                win32gui.DeleteObject(bitmap.GetHandle())
+            except Exception:
+                pass
+        if save_dc is not None:
+            try:
+                save_dc.DeleteDC()
+            except Exception:
+                pass
+        if mfc_dc is not None:
+            try:
+                mfc_dc.DeleteDC()
+            except Exception:
+                pass
+        if hwnd_dc:
+            try:
+                win32gui.ReleaseDC(hwnd, hwnd_dc)
+            except Exception:
+                pass
+    return qimg
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +163,12 @@ class Scanner(QThread):
     def run(self):
         while self._running:
             clients = []
-            found_pids: set[int] = set()
+            # cpu_percent(interval=None) measures since its own last call, so it
+            # must run exactly once per process per scan — a second call in the
+            # same scan (process with two matching windows) reads a ~0 ms
+            # interval and returns garbage. Memoize stats per pid.
+            pid_stats: dict[int, tuple[str, float, float]] = {}
+            seen_pids: set[int] = set()
 
             def _cb(hwnd, _):
                 if not win32gui.IsWindowVisible(hwnd):
@@ -135,24 +178,31 @@ class Scanner(QThread):
                     return
                 try:
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    # Reuse cached Process object so cpu_percent() is meaningful
-                    if pid not in self._proc_cache:
-                        self._proc_cache[pid] = psutil.Process(pid)
-                        # First call initialises the baseline; returns 0.0
-                        self._proc_cache[pid].cpu_percent(interval=None)
-                    proc = self._proc_cache[pid]
-                    proc_name = proc.name()
-                    cpu_pct   = proc.cpu_percent(interval=None)
-                    mem_mb    = proc.memory_info().rss / (1024 * 1024)
-                    found_pids.add(pid)
+                    seen_pids.add(pid)
+                    if pid not in pid_stats:
+                        # Reuse cached Process object so cpu_percent() is meaningful
+                        if pid not in self._proc_cache:
+                            proc = psutil.Process(pid)
+                            # First call initialises the baseline; returns 0.0
+                            proc.cpu_percent(interval=None)
+                            self._proc_cache[pid] = proc
+                        proc = self._proc_cache[pid]
+                        pid_stats[pid] = (
+                            proc.name(),
+                            proc.cpu_percent(interval=None) / NUM_CORES,
+                            proc.memory_info().rss / (1024 * 1024),
+                        )
+                    proc_name, cpu_pct, mem_mb = pid_stats[pid]
                 except Exception:
-                    pid, proc_name, cpu_pct, mem_mb = 0, "", 0.0, 0.0
+                    return
+                if not _is_bot_process(proc_name):
+                    return  # e.g. a browser tab titled "RuneScape Wiki"
                 clients.append((hwnd, title, pid, proc_name, cpu_pct, mem_mb))
 
             win32gui.EnumWindows(_cb, None)
 
-            # Evict stale entries from the cache
-            stale = set(self._proc_cache) - found_pids
+            # Evict cache entries for pids that no longer own a matching window
+            stale = set(self._proc_cache) - seen_pids
             for pid in stale:
                 del self._proc_cache[pid]
 
@@ -165,18 +215,23 @@ class Scanner(QThread):
 
     def stop(self):
         self._running = False
-        self.wait(2000)
+        if not self.wait(2000):
+            # Last resort at app exit: better than Qt aborting on a
+            # still-running thread during teardown.
+            self.terminate()
+            self.wait(1000)
 
 
 # ---------------------------------------------------------------------------
 # Capturer thread — loops over known hwnds and captures screenshots
 # ---------------------------------------------------------------------------
 class Capturer(QThread):
-    captured = pyqtSignal(int, QPixmap)  # hwnd, pixmap
+    captured = pyqtSignal(int, QImage)  # hwnd, frame (QPixmap is GUI-thread-only)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = True
+        self._paused = False
         self._hwnds: list[int] = []
         self._interval_ms = CAPTURE_INTERVAL_HIGH
 
@@ -186,24 +241,41 @@ class Capturer(QThread):
     def set_interval(self, ms: int):
         self._interval_ms = ms
 
+    def set_paused(self, paused: bool):
+        """Skip captures entirely (e.g. while BotWall itself is minimized)."""
+        self._paused = paused
+
     def run(self):
+        # Deadline-based pacing: the interval is the full cycle period, not a
+        # sleep appended after the work, so the refresh rate stays honest as
+        # long as one pass fits in the interval.
+        next_t = time.monotonic()
         while self._running:
-            for hwnd in list(self._hwnds):
-                if not self._running:
+            if not self._paused:
+                for hwnd in list(self._hwnds):
+                    if not self._running:
+                        break
+                    img = capture_hwnd(hwnd)
+                    if img is not None:
+                        self.captured.emit(hwnd, img)
+            next_t += self._interval_ms / 1000.0
+            now = time.monotonic()
+            if next_t <= now:
+                next_t = now  # pass overran the interval: restart, don't spiral
+            while self._running:
+                remaining = next_t - time.monotonic()
+                if remaining <= 0:
                     break
-                px = capture_hwnd(hwnd)
-                if px is not None:
-                    self.captured.emit(hwnd, px)
-                time.sleep(0.05)  # small pause between captures to avoid hammering
-            # Wait out the remainder of the interval
-            elapsed = 0
-            while elapsed < self._interval_ms and self._running:
-                time.sleep(0.1)
-                elapsed += 100
+                # Sleep in small chunks so stop() stays responsive
+                time.sleep(min(remaining, 0.1))
 
     def stop(self):
         self._running = False
-        self.wait(3000)
+        if not self.wait(3000):
+            # Likely stuck inside PrintWindow on a hung client. Better than
+            # Qt aborting on a still-running thread during teardown.
+            self.terminate()
+            self.wait(1000)
 
 
 # ---------------------------------------------------------------------------
@@ -392,14 +464,13 @@ class ClientCard(QFrame):
         if target_w <= 0 or target_h <= 0:
             return
 
-        src = self._pixmap_raw
-        if self._low_cpu:
-            # Convert to grayscale to reduce rendering work
-            gray = src.toImage().convertToFormat(QImage.Format_Grayscale8)
-            src = QPixmap.fromImage(gray)
-
         transform = Qt.FastTransformation if self._low_cpu else Qt.SmoothTransformation
-        scaled = src.scaled(target_w, target_h, Qt.KeepAspectRatio, transform)
+        scaled = self._pixmap_raw.scaled(target_w, target_h, Qt.KeepAspectRatio, transform)
+        if self._low_cpu:
+            # Grayscale the card-sized result, not the full-res frame —
+            # converting first costs more than the smooth scaling it replaces
+            gray = scaled.toImage().convertToFormat(QImage.Format_Grayscale8)
+            scaled = QPixmap.fromImage(gray)
         self._img_lbl.setPixmap(scaled)
 
     def resizeEvent(self, event):
@@ -748,7 +819,11 @@ class GridView(QScrollArea):
         return lambda h: 0
 
     def all_pids(self) -> list[int]:
-        return [c.pid for c in self._cards.values() if c.pid]
+        # Deduplicated: one process can own several client windows
+        return sorted({c.pid for c in self._cards.values() if c.pid})
+
+    def minimized_hwnds(self) -> set[int]:
+        return set(self._minimized)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1079,10 +1154,12 @@ class BotWall(QMainWindow):
         self._grid_view.client_minimized.connect(self._minimized_shelf.add_client)
         self._grid_view.client_removed.connect(self._minimized_shelf.remove_client)
         self._minimized_shelf.restore_requested.connect(self._on_restore_client)
+        # Shelved cards are hidden — stop capturing them
+        self._grid_view.client_minimized.connect(lambda *_: self._push_capture_hwnds())
 
     def _update_self_stats(self):
         try:
-            cpu = self._self_proc.cpu_percent(interval=None)
+            cpu = self._self_proc.cpu_percent(interval=None) / NUM_CORES
             mem_mb = self._self_proc.memory_info().rss / (1024 * 1024)
             mem_text = f"{mem_mb / 1024:.1f}GB" if mem_mb >= 1024 else f"{mem_mb:.0f}MB"
             self._self_cpu_lbl.setText(f"CPU: {cpu:.1f}%")
@@ -1090,10 +1167,17 @@ class BotWall(QMainWindow):
         except Exception:
             pass
 
+    def _push_capture_hwnds(self):
+        """Hand the Capturer only the hwnds whose cards are actually shown."""
+        minimized = self._grid_view.minimized_hwnds()
+        self._capturer.set_hwnds(
+            [c[0] for c in self._clients if c[0] not in minimized]
+        )
+
     def _on_scan(self, clients: list):
         self._clients = clients
-        self._capturer.set_hwnds([c[0] for c in clients])
         self._grid_view.update_clients(clients)
+        self._push_capture_hwnds()
         # Push live stats into minimized shelf strips
         for hwnd, title, pid, proc_name, cpu_pct, mem_mb in clients:
             self._minimized_shelf.update_stats(hwnd, cpu_pct, mem_mb)
@@ -1112,12 +1196,21 @@ class BotWall(QMainWindow):
         self._opens_lbl.setText(f"↑ {self._total_opens} Opened")
         self._closes_lbl.setText(f"↓ {self._total_closes} Closed")
 
-    def _on_capture(self, hwnd: int, pixmap: QPixmap):
-        self._grid_view.update_screenshot(hwnd, pixmap)
+    def _on_capture(self, hwnd: int, image: QImage):
+        # QImage → QPixmap here, on the GUI thread — the only thread where
+        # QPixmap is supported.
+        self._grid_view.update_screenshot(hwnd, QPixmap.fromImage(image))
 
     def _on_restore_client(self, hwnd: int):
         self._minimized_shelf.remove_client(hwnd)
         self._grid_view.restore_client(hwnd)
+        self._push_capture_hwnds()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # No point burning CPU on captures nobody can see
+        if event.type() == QEvent.WindowStateChange:
+            self._capturer.set_paused(self.isMinimized())
 
     def _on_sort_changed(self, idx: int):
         modes = ["default", "cpu_asc", "cpu_desc", "ram_asc", "ram_desc"]
@@ -1155,9 +1248,12 @@ class BotWall(QMainWindow):
         if not pids:
             QMessageBox.information(self, "BotWall", "No clients to kill.")
             return
+        names = sorted({c[3] for c in self._clients if c[2] in pids and c[3]})
+        name_line = f"Processes: {', '.join(names)}\n" if names else ""
         reply = QMessageBox.question(
             self, "Kill All",
             f"Kill {len(pids)} client process{'es' if len(pids) != 1 else ''}?\n"
+            f"{name_line}"
             "This will forcefully terminate them.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
