@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import sys
 import time
+import zlib
 import ctypes
+import winsound
 
 import psutil
 import win32gui
@@ -16,13 +18,14 @@ import win32process
 import win32con
 
 from PyQt5.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QUrl, QEvent
+    Qt, QThread, pyqtSignal, QTimer, QUrl, QEvent, QSettings
 )
 from PyQt5.QtGui import QPixmap, QImage, QColor, QCursor, QIcon, QDesktopServices
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QScrollArea, QGridLayout, QVBoxLayout, QHBoxLayout, QFrame,
-    QSizePolicy, QMessageBox, QComboBox, QMenu
+    QSizePolicy, QMessageBox, QComboBox, QMenu,
+    QSystemTrayIcon, QDialog, QPlainTextEdit
 )
 
 # ---------------------------------------------------------------------------
@@ -36,6 +39,12 @@ CARD_W_DEFAULT = 320
 CARD_H_DEFAULT = 220
 HEADER_H = 30
 ZOOM_FACTOR = 1.1
+
+# Freeze detection: a healthy game client repaints constantly, so an
+# unchanged frame is a strong "stuck/disconnected" signal.
+STALE_WARN_S   = 30    # amber "static" after this many unchanged seconds
+STALE_FROZEN_S = 120   # red "frozen" after this many
+NO_FEED_S      = 10    # dim "no feed" when captures stop arriving at all
 
 BG_COLOR        = "#12121e"
 TOOLBAR_COLOR   = "#09090f"
@@ -65,15 +74,13 @@ def _is_interesting(title: str) -> bool:
     return any(kw in tl for kw in KEYWORDS)
 
 
-def _is_dreambot41(title: str) -> bool:
-    """Returns True if the window title looks like a DreamBot 4.1.x client."""
-    tl = title.lower()
-    return "dreambot" in tl and "4.1" in tl
-
-
 def _is_bot_process(proc_name: str) -> bool:
     nl = proc_name.lower()
     return nl in BOT_PROC_NAMES or any(kw in nl for kw in BOT_PROC_KEYWORDS)
+
+
+def _fmt_age(seconds: float) -> str:
+    return f"{int(seconds)}s" if seconds < 60 else f"{int(seconds // 60)}m"
 
 
 def capture_hwnd(hwnd: int) -> QImage | None:
@@ -226,7 +233,9 @@ class Scanner(QThread):
 # Capturer thread — loops over known hwnds and captures screenshots
 # ---------------------------------------------------------------------------
 class Capturer(QThread):
-    captured = pyqtSignal(int, QImage)  # hwnd, frame (QPixmap is GUI-thread-only)
+    # hwnd, frame, seconds since the frame content last changed
+    # (QImage not QPixmap — pixmaps are GUI-thread-only)
+    captured = pyqtSignal(int, QImage, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -234,12 +243,23 @@ class Capturer(QThread):
         self._paused = False
         self._hwnds: list[int] = []
         self._interval_ms = CAPTURE_INTERVAL_HIGH
+        self._target_w = CARD_W_DEFAULT * 2
+        self._target_h = CARD_H_DEFAULT * 2
+        self._frame_state: dict[int, tuple[int, float]] = {}  # hwnd → (crc, last_change_t)
 
     def set_hwnds(self, hwnds: list[int]):
         self._hwnds = list(hwnds)
 
     def set_interval(self, ms: int):
         self._interval_ms = ms
+
+    def set_card_size(self, w: int, h: int):
+        # Frames are downscaled to 2x the card size here in the capture
+        # thread, so the GUI never stores or scales full-resolution captures
+        # (a 1080p client is ~8 MB/frame; 2x card size is ~0.3 MB). The 2x
+        # headroom keeps cards sharp through a zoom step.
+        self._target_w = max(1, w * 2)
+        self._target_h = max(1, h * 2)
 
     def set_paused(self, paused: bool):
         """Skip captures entirely (e.g. while BotWall itself is minimized)."""
@@ -257,7 +277,17 @@ class Capturer(QThread):
                         break
                     img = capture_hwnd(hwnd)
                     if img is not None:
-                        self.captured.emit(hwnd, img)
+                        if (img.width() > self._target_w
+                                or img.height() > self._target_h):
+                            img = img.scaled(
+                                self._target_w, self._target_h,
+                                Qt.KeepAspectRatio, Qt.SmoothTransformation
+                            )
+                        self.captured.emit(hwnd, img, self._frame_age(hwnd, img))
+                # Drop change-tracking state for windows we no longer capture
+                alive = set(self._hwnds)
+                for hwnd in [h for h in self._frame_state if h not in alive]:
+                    del self._frame_state[hwnd]
             next_t += self._interval_ms / 1000.0
             now = time.monotonic()
             if next_t <= now:
@@ -268,6 +298,18 @@ class Capturer(QThread):
                     break
                 # Sleep in small chunks so stop() stays responsive
                 time.sleep(min(remaining, 0.1))
+
+    def _frame_age(self, hwnd: int, img: QImage) -> float:
+        """Seconds since this window's frame content last changed."""
+        ptr = img.constBits()
+        ptr.setsize(img.byteCount())
+        crc = zlib.crc32(ptr)
+        now = time.monotonic()
+        prev = self._frame_state.get(hwnd)
+        if prev is None or prev[0] != crc:
+            self._frame_state[hwnd] = (crc, now)
+            return 0.0
+        return now - prev[1]
 
     def stop(self):
         self._running = False
@@ -282,8 +324,9 @@ class Capturer(QThread):
 # ClientCard — one card per detected client window
 # ---------------------------------------------------------------------------
 class ClientCard(QFrame):
-    pin_toggled       = pyqtSignal(int, bool)  # hwnd, is_pinned
-    minimize_requested = pyqtSignal(int)        # hwnd
+    pin_toggled        = pyqtSignal(int, bool)     # hwnd, is_pinned
+    minimize_requested = pyqtSignal(int)           # hwnd
+    kill_requested     = pyqtSignal(int, str, str) # pid, title, proc_name
 
     def __init__(self, hwnd: int, title: str, pid: int, proc_name: str,
                  cpu_pct: float = 0.0, mem_mb: float = 0.0, parent=None):
@@ -300,12 +343,7 @@ class ClientCard(QFrame):
 
         self.setFrameShape(QFrame.NoFrame)
         self.setCursor(QCursor(Qt.PointingHandCursor))
-        self.setStyleSheet(f"""
-            ClientCard {{
-                background: {CARD_COLOR};
-                border-radius: 4px;
-            }}
-        """)
+        self._set_border(None)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -329,6 +367,10 @@ class ClientCard(QFrame):
         self._mem_lbl = QLabel()
         self._mem_lbl.setStyleSheet(f"color: {DIM_COLOR}; font-size: 9px;")
 
+        self._status_lbl = QLabel()
+        self._status_lbl.setStyleSheet(f"color: {DIM_COLOR}; font-size: 9px; font-weight: bold;")
+        self._status_lbl.hide()
+
         self._pid_lbl = QLabel()
         self._pid_lbl.setStyleSheet(f"color: {ACCENT_TEAL}; font-size: 10px;")
 
@@ -340,6 +382,7 @@ class ClientCard(QFrame):
         self._pin_btn.clicked.connect(self._toggle_pin)
 
         h_layout.addWidget(self._title_lbl)
+        h_layout.addWidget(self._status_lbl)
         h_layout.addWidget(self._cpu_lbl)
         h_layout.addWidget(self._mem_lbl)
         h_layout.addWidget(self._pid_lbl)
@@ -357,6 +400,8 @@ class ClientCard(QFrame):
         self._update_labels(title, pid, proc_name)
         self._update_stats(cpu_pct, mem_mb)
         self._pixmap_raw: QPixmap | None = None
+        self._last_frame_ts = time.monotonic()
+        self._status_state: tuple | None = None
         self._update_pin_visual()
 
     # ------------------------------------------------------------------
@@ -364,6 +409,11 @@ class ClientCard(QFrame):
         self._pinned = not self._pinned
         self._update_pin_visual()
         self.pin_toggled.emit(self.hwnd, self._pinned)
+
+    def set_pinned(self, pinned: bool):
+        """Set pin state without emitting (used when restoring persisted pins)."""
+        self._pinned = pinned
+        self._update_pin_visual()
 
     def _update_pin_visual(self):
         if self._pinned:
@@ -392,6 +442,7 @@ class ClientCard(QFrame):
         max_chars = 26
         short = title if len(title) <= max_chars else title[:max_chars - 1] + "…"
         self._title_lbl.setText(short)
+        self._title_lbl.setToolTip(title)
         self._pid_lbl.setText(f"PID {pid}")
 
     def _update_stats(self, cpu_pct: float, mem_mb: float):
@@ -441,7 +492,16 @@ class ClientCard(QFrame):
         menu.addAction("Bring to Front", lambda: self._bring_to_front())
         menu.addSeparator()
         menu.addAction("Minimize to Shelf", lambda: self.minimize_requested.emit(self.hwnd))
+        menu.addAction("Copy PID", self._copy_pid)
+        menu.addSeparator()
+        menu.addAction(
+            "Kill This Client…",
+            lambda: self.kill_requested.emit(self.pid, self.title, self.proc_name)
+        )
         menu.exec_(event.globalPos())
+
+    def _copy_pid(self):
+        QApplication.clipboard().setText(str(self.pid))
 
     def _bring_to_front(self):
         try:
@@ -452,9 +512,58 @@ class ClientCard(QFrame):
         except Exception:
             pass
 
-    def update_pixmap(self, pixmap: QPixmap):
+    def update_pixmap(self, pixmap: QPixmap, age_s: float = 0.0):
         self._pixmap_raw = pixmap
+        self._last_frame_ts = time.monotonic()
+        self._set_freshness(age_s)
         self._rescale()
+
+    # ------------------------------------------------------------------
+    # Freshness / freeze indication
+    # ------------------------------------------------------------------
+    def _set_freshness(self, age_s: float):
+        if age_s >= STALE_FROZEN_S:
+            self._apply_status(f"FROZEN {_fmt_age(age_s)}", ACCENT_RED)
+        elif age_s >= STALE_WARN_S:
+            self._apply_status(f"static {_fmt_age(age_s)}", "#f0a040")
+        else:
+            self._apply_status(None, None)
+
+    def check_feed(self):
+        """Called once per scan: flag cards whose captures stopped arriving
+        (window OS-minimized, or PrintWindow failing)."""
+        if time.monotonic() - self._last_frame_ts > NO_FEED_S:
+            self._apply_status("NO FEED", DIM_COLOR)
+
+    def _apply_status(self, text: str | None, color: str | None):
+        state = (text, color)
+        if state == self._status_state:
+            return
+        self._status_state = state
+        if text is None:
+            self._status_lbl.hide()
+        else:
+            self._status_lbl.setText(text)
+            self._status_lbl.setStyleSheet(
+                f"color: {color}; font-size: 9px; font-weight: bold;"
+            )
+            self._status_lbl.show()
+            self._status_lbl.setToolTip(
+                "Frame content has not changed — client may be stuck or logged out"
+                if color != DIM_COLOR else
+                "No captures arriving (window minimized or capture failing)"
+            )
+        self._set_border(color)
+
+    def _set_border(self, color: str | None):
+        border = f"1px solid {color}" if color else "1px solid transparent"
+        self.setStyleSheet(f"""
+            ClientCard {{
+                background: {CARD_COLOR};
+                border-radius: 4px;
+                border: {border};
+            }}
+        """)
 
     def _rescale(self):
         if self._pixmap_raw is None:
@@ -671,6 +780,8 @@ class MinimizedShelf(QWidget):
 class GridView(QScrollArea):
     client_minimized = pyqtSignal(int, str, int, float, float)  # hwnd, title, pid, cpu, mem
     client_removed   = pyqtSignal(int)                           # hwnd (gone from scanner)
+    card_size_changed = pyqtSignal(int, int)                     # card w, h (zoom)
+    client_kill_requested = pyqtSignal(int, str, str)            # pid, title, proc_name
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -696,11 +807,14 @@ class GridView(QScrollArea):
         self._cards: dict[int, ClientCard] = {}         # hwnd → card
         self._order: list[int] = []                     # insertion order
         self._pinned: set[int] = set()                  # pinned hwnds
+        self._pinned_titles: set[str] = set()           # survives client restarts
         self._minimized: set[int] = set()               # minimized hwnds
         self._stats: dict[int, tuple[float, float]] = {}# hwnd → (cpu_pct, mem_mb)
         self._sort_mode = "default"
         self._placeholder: EmptyPlaceholder | None = None
         self._low_cpu = False
+        self._last_layout: tuple | None = None      # skip no-op relayouts
+        self._last_stretch = (0, 0)                 # (row, col) stretch to clear
         self._show_placeholder()
 
     # ------------------------------------------------------------------
@@ -734,9 +848,15 @@ class GridView(QScrollArea):
                 card.set_low_cpu(self._low_cpu)
                 card.pin_toggled.connect(self._on_pin_toggled)
                 card.minimize_requested.connect(self._on_minimize_requested)
+                card.kill_requested.connect(self.client_kill_requested)
                 self._fix_card_size(card)
                 self._cards[hwnd] = card
                 self._order.append(hwnd)
+                # Pins are persisted by title so they survive client restarts
+                # (hwnds don't)
+                if title in self._pinned_titles:
+                    card.set_pinned(True)
+                    self._pinned.add(hwnd)
             else:
                 self._cards[hwnd].update_info(title, pid, proc_name, cpu_pct, mem_mb)
 
@@ -748,16 +868,34 @@ class GridView(QScrollArea):
         else:
             self._show_placeholder()
 
-    def update_screenshot(self, hwnd: int, pixmap: QPixmap):
+    def update_screenshot(self, hwnd: int, pixmap: QPixmap, age_s: float = 0.0):
         if hwnd in self._cards:
-            self._cards[hwnd].update_pixmap(pixmap)
+            self._cards[hwnd].update_pixmap(pixmap, age_s)
+
+    def check_feeds(self):
+        """Flag visible cards whose captures have stopped arriving."""
+        for hwnd, card in self._cards.items():
+            if hwnd not in self._minimized:
+                card.check_feed()
 
     def zoom(self, factor: float):
-        self._card_w = max(160, int(self._card_w * factor))
-        self._card_h = max(110, int(self._card_h * factor))
+        self._card_w = max(160, min(1600, int(self._card_w * factor)))
+        self._card_h = max(110, min(1100, int(self._card_h * factor)))
         for card in self._cards.values():
             self._fix_card_size(card)
         self._relayout()
+        self.card_size_changed.emit(self._card_w, self._card_h)
+
+    def card_size(self) -> tuple[int, int]:
+        return (self._card_w, self._card_h)
+
+    def set_card_size(self, w: int, h: int):
+        self._card_w = max(160, min(1600, w))
+        self._card_h = max(110, min(1100, h))
+        for card in self._cards.values():
+            self._fix_card_size(card)
+        self._relayout()
+        self.card_size_changed.emit(self._card_w, self._card_h)
 
     def set_low_cpu(self, enabled: bool):
         self._low_cpu = enabled
@@ -765,11 +903,27 @@ class GridView(QScrollArea):
             card.set_low_cpu(enabled)
 
     def _on_pin_toggled(self, hwnd: int, is_pinned: bool):
+        card = self._cards.get(hwnd)
         if is_pinned:
             self._pinned.add(hwnd)
+            if card:
+                self._pinned_titles.add(card.title)
         else:
             self._pinned.discard(hwnd)
+            if card:
+                self._pinned_titles.discard(card.title)
         self._relayout()
+
+    def set_pinned_titles(self, titles: set[str]):
+        self._pinned_titles = set(titles)
+        for hwnd, card in self._cards.items():
+            if card.title in self._pinned_titles and hwnd not in self._pinned:
+                card.set_pinned(True)
+                self._pinned.add(hwnd)
+        self._relayout()
+
+    def pinned_titles(self) -> set[str]:
+        return set(self._pinned_titles)
 
     def _on_minimize_requested(self, hwnd: int):
         if hwnd in self._cards and hwnd not in self._minimized:
@@ -834,22 +988,35 @@ class GridView(QScrollArea):
     def _relayout(self):
         vp_w = self.viewport().width() - 20  # subtract margins
         cols = max(1, vp_w // (self._card_w + self._grid.spacing()))
+        display_order = self._sorted_order()
 
-        # Remove all items from grid without deleting
+        signature = (tuple(display_order), cols, self._card_w, self._card_h)
+        if signature == self._last_layout:
+            return  # nothing moved — skip the remove/re-add churn
+        self._last_layout = signature
+
+        # Remove all cards from grid without deleting (placeholder stays put —
+        # pulling it out of the layout would orphan it uncentered)
         for i in reversed(range(self._grid.count())):
             item = self._grid.itemAt(i)
-            if item and item.widget():
-                self._grid.removeWidget(item.widget())
+            w = item.widget() if item else None
+            if w is not None and w is not self._placeholder:
+                self._grid.removeWidget(w)
 
-        display_order = self._sorted_order()
         for idx, hwnd in enumerate(display_order):
             card = self._cards[hwnd]
             row, col = divmod(idx, cols)
             self._grid.addWidget(card, row, col)
 
-        # Push cards to top-left
-        self._grid.setRowStretch(len(display_order) // cols + 1, 1)
+        # Clear the previous stretch before setting the new one, or stale
+        # stretches accumulate and split the free space with phantom rows/cols
+        old_row, old_col = self._last_stretch
+        self._grid.setRowStretch(old_row, 0)
+        self._grid.setColumnStretch(old_col, 0)
+        stretch_row = len(display_order) // cols + 1
+        self._grid.setRowStretch(stretch_row, 1)
         self._grid.setColumnStretch(cols, 1)
+        self._last_stretch = (stretch_row, cols)
 
     def _show_placeholder(self):
         if self._placeholder is None:
@@ -892,11 +1059,16 @@ class BotWall(QMainWindow):
         self._clients: list[tuple] = []
         self._total_opens = 0
         self._total_closes = 0
-        self._active_dreambot_hwnds: dict[int, str] = {}  # hwnd → title for open 4.1.x clients
+        self._active_hwnds: dict[int, str] = {}  # hwnd → title for open clients
+        self._events: list[str] = []
+        self._low_cpu_active = False
         self._self_proc = psutil.Process()
         self._self_proc.cpu_percent(interval=None)  # prime the baseline
+        self._settings = QSettings("BotWall", "BotWall")
         self._setup_ui()
+        self._setup_tray()
         self._start_threads()
+        self._restore_settings()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -947,14 +1119,14 @@ class BotWall(QMainWindow):
         # ---- Session client stats ----
         self._opens_lbl = QLabel("↑ 0 Opened")
         self._opens_lbl.setStyleSheet("color: #4dc87a; font-size: 12px;")
-        self._opens_lbl.setToolTip("DreamBot 4.1.x clients opened this session")
+        self._opens_lbl.setToolTip("Clients opened this session")
         tb_layout.addWidget(self._opens_lbl)
 
         tb_layout.addSpacing(10)
 
         self._closes_lbl = QLabel("↓ 0 Closed")
         self._closes_lbl.setStyleSheet("color: #e07050; font-size: 12px;")
-        self._closes_lbl.setToolTip("DreamBot 4.1.x clients closed this session")
+        self._closes_lbl.setToolTip("Clients closed this session")
         tb_layout.addWidget(self._closes_lbl)
 
         tb_layout.addSpacing(10)
@@ -969,7 +1141,7 @@ class BotWall(QMainWindow):
         tb_layout.addStretch()
 
         # ---- Sort control ----
-        sort_combo = QComboBox()
+        sort_combo = self._sort_combo = QComboBox()
         sort_combo.addItems(["Sort: Default", "CPU ↑", "CPU ↓", "RAM ↑", "RAM ↓"])
         sort_combo.setFixedHeight(28)
         sort_combo.setFixedWidth(120)
@@ -1095,6 +1267,26 @@ class BotWall(QMainWindow):
         restore_all_btn.setToolTip("Restore all DreamBot windows")
         restore_all_btn.clicked.connect(self._restore_all)
         tb_layout.addWidget(restore_all_btn)
+
+        log_btn = QPushButton("Log")
+        log_btn.setFixedHeight(28)
+        log_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        log_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {DIM_COLOR};
+                border: 1px solid {DIM_COLOR};
+                border-radius: 3px;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 0 8px;
+            }}
+            QPushButton:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
+            QPushButton:pressed {{ background: #1a3a40; }}
+        """)
+        log_btn.setToolTip("Session event log (opens, closes, title changes)")
+        log_btn.clicked.connect(self._show_log)
+        tb_layout.addWidget(log_btn)
         tb_layout.addSpacing(8)
 
         kill_btn = QPushButton("KILL ALL")
@@ -1133,6 +1325,56 @@ class BotWall(QMainWindow):
         self.setCentralWidget(central)
 
     # ------------------------------------------------------------------
+    # Tray icon + event log + alerts
+    # ------------------------------------------------------------------
+    def _setup_tray(self):
+        self._tray = QSystemTrayIcon(self)
+        self._tray.setIcon(QApplication.windowIcon())
+        self._tray.setToolTip("BotWall")
+        self._tray.setVisible(True)
+        self._tray.activated.connect(self._on_tray_activated)
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            self.showNormal()
+            self.activateWindow()
+
+    def _log_event(self, msg: str):
+        self._events.append(f"{time.strftime('%H:%M:%S')}  {msg}")
+        if len(self._events) > 500:
+            del self._events[:-500]
+
+    def _alert_client_closed(self, title: str):
+        self._log_event(f"Client closed: {title}")
+        try:
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception:
+            pass
+        QApplication.alert(self)  # flash the taskbar entry
+        if self._tray.isVisible() and QSystemTrayIcon.supportsMessages():
+            self._tray.showMessage(
+                "BotWall — client closed", title,
+                QSystemTrayIcon.Warning, 5000
+            )
+
+    def _show_log(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("BotWall — Event Log")
+        dlg.resize(560, 420)
+        dlg.setStyleSheet(f"background: {BG_COLOR};")
+        layout = QVBoxLayout(dlg)
+        txt = QPlainTextEdit()
+        txt.setReadOnly(True)
+        txt.setStyleSheet(
+            f"background: {CARD_COLOR}; color: {TEXT_COLOR}; "
+            f"border: none; font-size: 12px;"
+        )
+        txt.setPlainText("\n".join(self._events) if self._events else "No events yet.")
+        txt.verticalScrollBar().setValue(txt.verticalScrollBar().maximum())
+        layout.addWidget(txt)
+        dlg.exec_()
+
+    # ------------------------------------------------------------------
     # Threading
     # ------------------------------------------------------------------
     def _start_threads(self):
@@ -1142,6 +1384,8 @@ class BotWall(QMainWindow):
 
         self._capturer = Capturer()
         self._capturer.captured.connect(self._on_capture)
+        self._capturer.set_card_size(*self._grid_view.card_size())
+        self._grid_view.card_size_changed.connect(self._capturer.set_card_size)
         self._capturer.start()
 
         # Self-stats refresh timer
@@ -1156,6 +1400,7 @@ class BotWall(QMainWindow):
         self._minimized_shelf.restore_requested.connect(self._on_restore_client)
         # Shelved cards are hidden — stop capturing them
         self._grid_view.client_minimized.connect(lambda *_: self._push_capture_hwnds())
+        self._grid_view.client_kill_requested.connect(self._on_kill_client)
 
     def _update_self_stats(self):
         try:
@@ -1177,6 +1422,7 @@ class BotWall(QMainWindow):
     def _on_scan(self, clients: list):
         self._clients = clients
         self._grid_view.update_clients(clients)
+        self._grid_view.check_feeds()
         self._push_capture_hwnds()
         # Push live stats into minimized shelf strips
         for hwnd, title, pid, proc_name, cpu_pct, mem_mb in clients:
@@ -1184,22 +1430,30 @@ class BotWall(QMainWindow):
         n = len(clients)
         self._count_lbl.setText(f"{n} client{'s' if n != 1 else ''}")
 
-        # Track DreamBot 4.1.x opens and closes
+        # Track client opens, closes, and title changes
         new_hwnd_titles = {c[0]: c[1] for c in clients}
         for hwnd, title in new_hwnd_titles.items():
-            if hwnd not in self._active_dreambot_hwnds and _is_dreambot41(title):
-                self._active_dreambot_hwnds[hwnd] = title
+            if hwnd not in self._active_hwnds:
+                self._active_hwnds[hwnd] = title
                 self._total_opens += 1
-        for hwnd in set(self._active_dreambot_hwnds) - set(new_hwnd_titles):
-            del self._active_dreambot_hwnds[hwnd]
+                self._log_event(f"Client opened: {title}")
+            elif self._active_hwnds[hwnd] != title:
+                # Title changes often signal logout / script stop / world hop
+                self._log_event(
+                    f'Title changed: "{self._active_hwnds[hwnd]}" → "{title}"'
+                )
+                self._active_hwnds[hwnd] = title
+        for hwnd in set(self._active_hwnds) - set(new_hwnd_titles):
+            old_title = self._active_hwnds.pop(hwnd)
             self._total_closes += 1
+            self._alert_client_closed(old_title)
         self._opens_lbl.setText(f"↑ {self._total_opens} Opened")
         self._closes_lbl.setText(f"↓ {self._total_closes} Closed")
 
-    def _on_capture(self, hwnd: int, image: QImage):
+    def _on_capture(self, hwnd: int, image: QImage, age_s: float):
         # QImage → QPixmap here, on the GUI thread — the only thread where
         # QPixmap is supported.
-        self._grid_view.update_screenshot(hwnd, QPixmap.fromImage(image))
+        self._grid_view.update_screenshot(hwnd, QPixmap.fromImage(image), age_s)
 
     def _on_restore_client(self, hwnd: int):
         self._minimized_shelf.remove_client(hwnd)
@@ -1218,10 +1472,48 @@ class BotWall(QMainWindow):
 
     def _set_cpu_mode(self, mode: str):
         low = (mode == "low")
+        self._low_cpu_active = low
         self._capturer.set_interval(CAPTURE_INTERVAL_LOW if low else CAPTURE_INTERVAL_HIGH)
         self._grid_view.set_low_cpu(low)
         self._btn_high_cpu.setStyleSheet(self._cpu_btn_style(not low))
         self._btn_low_cpu.setStyleSheet(self._cpu_btn_style(low))
+
+    # ------------------------------------------------------------------
+    # Settings persistence
+    # ------------------------------------------------------------------
+    def _restore_settings(self):
+        s = self._settings
+        geo = s.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        try:
+            card_w = int(s.value("card_w", CARD_W_DEFAULT))
+            card_h = int(s.value("card_h", CARD_H_DEFAULT))
+        except (TypeError, ValueError):
+            card_w, card_h = CARD_W_DEFAULT, CARD_H_DEFAULT
+        self._grid_view.set_card_size(card_w, card_h)
+        try:
+            sort_idx = int(s.value("sort_index", 0))
+        except (TypeError, ValueError):
+            sort_idx = 0
+        if 0 <= sort_idx < self._sort_combo.count():
+            self._sort_combo.setCurrentIndex(sort_idx)
+        if s.value("cpu_mode", "high") == "low":
+            self._set_cpu_mode("low")
+        pinned = s.value("pinned_titles", []) or []
+        if isinstance(pinned, str):
+            pinned = [pinned]
+        self._grid_view.set_pinned_titles(set(pinned))
+
+    def _save_settings(self):
+        s = self._settings
+        s.setValue("geometry", self.saveGeometry())
+        card_w, card_h = self._grid_view.card_size()
+        s.setValue("card_w", card_w)
+        s.setValue("card_h", card_h)
+        s.setValue("sort_index", self._sort_combo.currentIndex())
+        s.setValue("cpu_mode", "low" if self._low_cpu_active else "high")
+        s.setValue("pinned_titles", sorted(self._grid_view.pinned_titles()))
 
     # ------------------------------------------------------------------
     # Maximize / Restore all
@@ -1241,8 +1533,35 @@ class BotWall(QMainWindow):
                 pass
 
     # ------------------------------------------------------------------
-    # Kill all
+    # Kill one / kill all
     # ------------------------------------------------------------------
+    def _on_kill_client(self, pid: int, title: str, proc_name: str):
+        if not pid:
+            return
+        # One process can own several client windows — killing it takes
+        # all of them down; warn if that's the case.
+        siblings = sum(1 for c in self._clients if c[2] == pid) - 1
+        extra = (
+            f"\nNote: {siblings} other window{'s' if siblings != 1 else ''} "
+            "of this process will close too."
+            if siblings > 0 else ""
+        )
+        reply = QMessageBox.question(
+            self, "Kill Client",
+            f'Kill "{title}"?\n'
+            f"Process {proc_name} (PID {pid}) will be forcefully terminated."
+            f"{extra}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            psutil.Process(pid).kill()
+            self._log_event(f"Killed client: {title} (PID {pid})")
+        except Exception:
+            self._log_event(f"Failed to kill PID {pid} ({title})")
+
     def _kill_all(self):
         pids = self._grid_view.all_pids()
         if not pids:
@@ -1260,17 +1579,22 @@ class BotWall(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
+        killed = 0
         for pid in pids:
             try:
                 p = psutil.Process(pid)
                 p.kill()
+                killed += 1
             except Exception:
                 pass
+        self._log_event(f"KILL ALL: terminated {killed}/{len(pids)} processes")
 
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
     def closeEvent(self, event):
+        self._save_settings()
+        self._tray.setVisible(False)  # avoid a ghost tray icon after exit
         self._scanner.stop()
         self._capturer.stop()
         event.accept()
