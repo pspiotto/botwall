@@ -6,10 +6,12 @@ Requires: PyQt5, pywin32, psutil (Python 3.10+)
 from __future__ import annotations
 
 import sys
+import json
 import time
 import zlib
 import ctypes
 import winsound
+import subprocess
 
 import psutil
 import win32gui
@@ -20,12 +22,15 @@ import win32con
 from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QUrl, QEvent, QSettings
 )
-from PyQt5.QtGui import QPixmap, QImage, QColor, QCursor, QIcon, QDesktopServices
+from PyQt5.QtGui import (
+    QPixmap, QImage, QColor, QCursor, QIcon, QDesktopServices, QKeySequence
+)
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QScrollArea, QGridLayout, QVBoxLayout, QHBoxLayout, QFrame,
     QSizePolicy, QMessageBox, QComboBox, QMenu,
-    QSystemTrayIcon, QDialog, QPlainTextEdit
+    QSystemTrayIcon, QDialog, QPlainTextEdit,
+    QShortcut, QInputDialog, QLineEdit, QFormLayout, QDialogButtonBox
 )
 
 # ---------------------------------------------------------------------------
@@ -69,9 +74,9 @@ NUM_CORES = psutil.cpu_count() or 1
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _is_interesting(title: str) -> bool:
+def _is_interesting(title: str, keywords=KEYWORDS) -> bool:
     tl = title.lower()
-    return any(kw in tl for kw in KEYWORDS)
+    return any(kw in tl for kw in keywords)
 
 
 def _is_bot_process(proc_name: str) -> bool:
@@ -81,6 +86,17 @@ def _is_bot_process(proc_name: str) -> bool:
 
 def _fmt_age(seconds: float) -> str:
     return f"{int(seconds)}s" if seconds < 60 else f"{int(seconds // 60)}m"
+
+
+def _fmt_uptime(seconds: float) -> str:
+    m = int(seconds // 60)
+    if m < 60:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h{m:02d}m"
+    d, h = divmod(h, 24)
+    return f"{d}d{h}h"
 
 
 def capture_hwnd(hwnd: int) -> QImage | None:
@@ -157,15 +173,21 @@ def capture_hwnd(hwnd: int) -> QImage | None:
 
 
 # ---------------------------------------------------------------------------
-# Scanner thread — emits list of (hwnd, title, pid, proc_name, cpu_pct, mem_mb)
+# Scanner thread — emits list of (hwnd, title, pid, proc_name, cpu_pct,
+# mem_mb, uptime_s)
 # ---------------------------------------------------------------------------
 class Scanner(QThread):
-    updated = pyqtSignal(list)  # list of (hwnd, title, pid, proc_name, cpu_pct, mem_mb)
+    updated = pyqtSignal(list)  # list of 7-tuples, see header above
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = True
         self._proc_cache: dict[int, psutil.Process] = {}  # pid → Process
+        self._keywords: list[str] = list(KEYWORDS)
+
+    def set_keywords(self, keywords: list[str]):
+        """Replace the title keywords (from the settings dialog)."""
+        self._keywords = [kw.lower() for kw in keywords if kw.strip()] or list(KEYWORDS)
 
     def run(self):
         while self._running:
@@ -174,14 +196,15 @@ class Scanner(QThread):
             # must run exactly once per process per scan — a second call in the
             # same scan (process with two matching windows) reads a ~0 ms
             # interval and returns garbage. Memoize stats per pid.
-            pid_stats: dict[int, tuple[str, float, float]] = {}
+            pid_stats: dict[int, tuple[str, float, float, float]] = {}
             seen_pids: set[int] = set()
+            scan_t = time.time()
 
             def _cb(hwnd, _):
                 if not win32gui.IsWindowVisible(hwnd):
                     return
                 title = win32gui.GetWindowText(hwnd)
-                if not title or not _is_interesting(title):
+                if not title or not _is_interesting(title, self._keywords):
                     return
                 try:
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
@@ -198,13 +221,14 @@ class Scanner(QThread):
                             proc.name(),
                             proc.cpu_percent(interval=None) / NUM_CORES,
                             proc.memory_info().rss / (1024 * 1024),
+                            max(0.0, scan_t - proc.create_time()),
                         )
-                    proc_name, cpu_pct, mem_mb = pid_stats[pid]
+                    proc_name, cpu_pct, mem_mb, uptime_s = pid_stats[pid]
                 except Exception:
                     return
                 if not _is_bot_process(proc_name):
                     return  # e.g. a browser tab titled "RuneScape Wiki"
-                clients.append((hwnd, title, pid, proc_name, cpu_pct, mem_mb))
+                clients.append((hwnd, title, pid, proc_name, cpu_pct, mem_mb, uptime_s))
 
             win32gui.EnumWindows(_cb, None)
 
@@ -327,16 +351,21 @@ class ClientCard(QFrame):
     pin_toggled        = pyqtSignal(int, bool)     # hwnd, is_pinned
     minimize_requested = pyqtSignal(int)           # hwnd
     kill_requested     = pyqtSignal(int, str, str) # pid, title, proc_name
+    restart_requested  = pyqtSignal(int, str, str) # pid, title, proc_name
+    nickname_changed   = pyqtSignal(int, str)      # hwnd, new nickname ("" clears)
 
     def __init__(self, hwnd: int, title: str, pid: int, proc_name: str,
-                 cpu_pct: float = 0.0, mem_mb: float = 0.0, parent=None):
+                 cpu_pct: float = 0.0, mem_mb: float = 0.0,
+                 uptime_s: float = 0.0, parent=None):
         super().__init__(parent)
         self.hwnd = hwnd
         self.pid = pid
         self.proc_name = proc_name
         self.title = title
+        self.nickname = ""
         self._cpu_pct = cpu_pct
         self._mem_mb  = mem_mb
+        self._uptime_s = uptime_s
 
         self._low_cpu = False
         self._pinned = False
@@ -397,7 +426,7 @@ class ClientCard(QFrame):
         layout.addWidget(self._header)
         layout.addWidget(self._img_lbl)
 
-        self._update_labels(title, pid, proc_name)
+        self._update_labels()
         self._update_stats(cpu_pct, mem_mb)
         self._pixmap_raw: QPixmap | None = None
         self._last_frame_ts = time.monotonic()
@@ -438,12 +467,22 @@ class ClientCard(QFrame):
             self._bring_to_front()
         super().mousePressEvent(event)
 
-    def _update_labels(self, title: str, pid: int, proc_name: str):
+    def _update_labels(self):
+        display = self.nickname or self.title
         max_chars = 26
-        short = title if len(title) <= max_chars else title[:max_chars - 1] + "…"
+        short = display if len(display) <= max_chars else display[:max_chars - 1] + "…"
         self._title_lbl.setText(short)
-        self._title_lbl.setToolTip(title)
-        self._pid_lbl.setText(f"PID {pid}")
+        tooltip = self.title if not self.nickname else f"{self.nickname}\n{self.title}"
+        self._title_lbl.setToolTip(tooltip)
+        if self._uptime_s > 0:
+            self._pid_lbl.setText(f"PID {self.pid} · {_fmt_uptime(self._uptime_s)}")
+        else:
+            self._pid_lbl.setText(f"PID {self.pid}")
+        self._pid_lbl.setToolTip("PID · process uptime (low uptime = recently restarted)")
+
+    def set_nickname(self, nickname: str):
+        self.nickname = nickname
+        self._update_labels()
 
     def _update_stats(self, cpu_pct: float, mem_mb: float):
         self._cpu_pct = cpu_pct
@@ -476,11 +515,13 @@ class ClientCard(QFrame):
         self._mem_lbl.setToolTip(f"RAM: {mem_text}")
 
     def update_info(self, title: str, pid: int, proc_name: str,
-                    cpu_pct: float = 0.0, mem_mb: float = 0.0):
+                    cpu_pct: float = 0.0, mem_mb: float = 0.0,
+                    uptime_s: float = 0.0):
         self.pid = pid
         self.proc_name = proc_name
         self.title = title
-        self._update_labels(title, pid, proc_name)
+        self._uptime_s = uptime_s
+        self._update_labels()
         self._update_stats(cpu_pct, mem_mb)
 
     def contextMenuEvent(self, event):
@@ -492,8 +533,13 @@ class ClientCard(QFrame):
         menu.addAction("Bring to Front", lambda: self._bring_to_front())
         menu.addSeparator()
         menu.addAction("Minimize to Shelf", lambda: self.minimize_requested.emit(self.hwnd))
+        menu.addAction("Set Nickname…", self._edit_nickname)
         menu.addAction("Copy PID", self._copy_pid)
         menu.addSeparator()
+        menu.addAction(
+            "Restart Client…",
+            lambda: self.restart_requested.emit(self.pid, self.title, self.proc_name)
+        )
         menu.addAction(
             "Kill This Client…",
             lambda: self.kill_requested.emit(self.pid, self.title, self.proc_name)
@@ -502,6 +548,16 @@ class ClientCard(QFrame):
 
     def _copy_pid(self):
         QApplication.clipboard().setText(str(self.pid))
+
+    def _edit_nickname(self):
+        text, ok = QInputDialog.getText(
+            self, "Set Nickname",
+            "Nickname for this client (empty to clear):",
+            QLineEdit.Normal, self.nickname
+        )
+        if ok:
+            self.set_nickname(text.strip())
+            self.nickname_changed.emit(self.hwnd, self.nickname)
 
     def _bring_to_front(self):
         try:
@@ -782,6 +838,8 @@ class GridView(QScrollArea):
     client_removed   = pyqtSignal(int)                           # hwnd (gone from scanner)
     card_size_changed = pyqtSignal(int, int)                     # card w, h (zoom)
     client_kill_requested = pyqtSignal(int, str, str)            # pid, title, proc_name
+    client_restart_requested = pyqtSignal(int, str, str)         # pid, title, proc_name
+    nicknames_changed = pyqtSignal()                             # persist trigger
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -808,6 +866,7 @@ class GridView(QScrollArea):
         self._order: list[int] = []                     # insertion order
         self._pinned: set[int] = set()                  # pinned hwnds
         self._pinned_titles: set[str] = set()           # survives client restarts
+        self._nicknames: dict[str, str] = {}            # title → nickname
         self._minimized: set[int] = set()               # minimized hwnds
         self._stats: dict[int, tuple[float, float]] = {}# hwnd → (cpu_pct, mem_mb)
         self._sort_mode = "default"
@@ -821,7 +880,7 @@ class GridView(QScrollArea):
     # Public API
     # ------------------------------------------------------------------
     def update_clients(self, clients: list[tuple]):
-        """Called from main thread with fresh 6-tuple list."""
+        """Called from main thread with fresh 7-tuple list (see Scanner)."""
         new_hwnds = {c[0] for c in clients}
         current_hwnds = set(self._cards.keys())
 
@@ -841,24 +900,30 @@ class GridView(QScrollArea):
                 self.client_removed.emit(hwnd)
 
         # Add/update cards
-        for hwnd, title, pid, proc_name, cpu_pct, mem_mb in clients:
+        for hwnd, title, pid, proc_name, cpu_pct, mem_mb, uptime_s in clients:
             self._stats[hwnd] = (cpu_pct, mem_mb)
             if hwnd not in self._cards:
-                card = ClientCard(hwnd, title, pid, proc_name, cpu_pct, mem_mb)
+                card = ClientCard(hwnd, title, pid, proc_name, cpu_pct, mem_mb, uptime_s)
                 card.set_low_cpu(self._low_cpu)
                 card.pin_toggled.connect(self._on_pin_toggled)
                 card.minimize_requested.connect(self._on_minimize_requested)
                 card.kill_requested.connect(self.client_kill_requested)
+                card.restart_requested.connect(self.client_restart_requested)
+                card.nickname_changed.connect(self._on_nickname_changed)
                 self._fix_card_size(card)
                 self._cards[hwnd] = card
                 self._order.append(hwnd)
-                # Pins are persisted by title so they survive client restarts
-                # (hwnds don't)
+                # Pins and nicknames are persisted by title so they survive
+                # client restarts (hwnds don't)
                 if title in self._pinned_titles:
                     card.set_pinned(True)
                     self._pinned.add(hwnd)
+                if title in self._nicknames:
+                    card.set_nickname(self._nicknames[title])
             else:
-                self._cards[hwnd].update_info(title, pid, proc_name, cpu_pct, mem_mb)
+                self._cards[hwnd].update_info(
+                    title, pid, proc_name, cpu_pct, mem_mb, uptime_s
+                )
 
         self._relayout()
 
@@ -925,6 +990,24 @@ class GridView(QScrollArea):
     def pinned_titles(self) -> set[str]:
         return set(self._pinned_titles)
 
+    def _on_nickname_changed(self, hwnd: int, nickname: str):
+        card = self._cards.get(hwnd)
+        if card is None:
+            return
+        if nickname:
+            self._nicknames[card.title] = nickname
+        else:
+            self._nicknames.pop(card.title, None)
+        self.nicknames_changed.emit()
+
+    def set_nicknames(self, nicknames: dict[str, str]):
+        self._nicknames = dict(nicknames)
+        for card in self._cards.values():
+            card.set_nickname(self._nicknames.get(card.title, ""))
+
+    def nicknames(self) -> dict[str, str]:
+        return dict(self._nicknames)
+
     def _on_minimize_requested(self, hwnd: int):
         if hwnd in self._cards and hwnd not in self._minimized:
             self._minimized.add(hwnd)
@@ -961,15 +1044,20 @@ class GridView(QScrollArea):
         return pinned + unpinned
 
     def _sort_key(self):
-        """Return a sort key function for hwnd based on current sort mode."""
+        """Return a sort key function for hwnd based on current sort mode.
+
+        Values are bucketed (CPU into 10%-steps, RAM into 200 MB-steps) so
+        small fluctuations between scans don't reshuffle the grid under the
+        cursor every 3 s — ties keep their previous order (stable sort).
+        """
         if self._sort_mode == "cpu_asc":
-            return lambda h: self._stats.get(h, (0.0, 0.0))[0]
+            return lambda h: int(self._stats.get(h, (0.0, 0.0))[0] // 10)
         if self._sort_mode == "cpu_desc":
-            return lambda h: -self._stats.get(h, (0.0, 0.0))[0]
+            return lambda h: -int(self._stats.get(h, (0.0, 0.0))[0] // 10)
         if self._sort_mode == "ram_asc":
-            return lambda h: self._stats.get(h, (0.0, 0.0))[1]
+            return lambda h: int(self._stats.get(h, (0.0, 0.0))[1] // 200)
         if self._sort_mode == "ram_desc":
-            return lambda h: -self._stats.get(h, (0.0, 0.0))[1]
+            return lambda h: -int(self._stats.get(h, (0.0, 0.0))[1] // 200)
         return lambda h: 0
 
     def all_pids(self) -> list[int]:
@@ -1061,6 +1149,8 @@ class BotWall(QMainWindow):
         self._total_closes = 0
         self._active_hwnds: dict[int, str] = {}  # hwnd → title for open clients
         self._events: list[str] = []
+        self._alert_words: list[str] = []
+        self._scan_keywords: list[str] = list(KEYWORDS)
         self._low_cpu_active = False
         self._self_proc = psutil.Process()
         self._self_proc.cpu_percent(interval=None)  # prime the baseline
@@ -1166,6 +1256,39 @@ class BotWall(QMainWindow):
         """)
         sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         tb_layout.addWidget(sort_combo)
+        tb_layout.addSpacing(8)
+
+        # ---- Zoom controls (also available via Ctrl+wheel / Ctrl+= / Ctrl+- / Ctrl+0) ----
+        def _small_btn(text: str, tip: str) -> QPushButton:
+            b = QPushButton(text)
+            b.setFixedSize(28, 28)
+            b.setCursor(QCursor(Qt.PointingHandCursor))
+            b.setToolTip(tip)
+            b.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent;
+                    color: {DIM_COLOR};
+                    border: 1px solid {DIM_COLOR};
+                    border-radius: 3px;
+                    font-size: 13px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
+                QPushButton:pressed {{ background: #1a3a40; }}
+            """)
+            return b
+
+        zoom_out_btn = _small_btn("−", "Smaller cards (Ctrl+-)")
+        zoom_out_btn.clicked.connect(lambda: self._grid_view.zoom(1.0 / ZOOM_FACTOR))
+        zoom_reset_btn = _small_btn("⤢", "Reset card size (Ctrl+0)")
+        zoom_reset_btn.clicked.connect(
+            lambda: self._grid_view.set_card_size(CARD_W_DEFAULT, CARD_H_DEFAULT)
+        )
+        zoom_in_btn = _small_btn("+", "Larger cards (Ctrl+=)")
+        zoom_in_btn.clicked.connect(lambda: self._grid_view.zoom(ZOOM_FACTOR))
+        tb_layout.addWidget(zoom_out_btn)
+        tb_layout.addWidget(zoom_reset_btn)
+        tb_layout.addWidget(zoom_in_btn)
         tb_layout.addSpacing(8)
 
         # ---- CPU mode toggle ----
@@ -1287,6 +1410,10 @@ class BotWall(QMainWindow):
         log_btn.setToolTip("Session event log (opens, closes, title changes)")
         log_btn.clicked.connect(self._show_log)
         tb_layout.addWidget(log_btn)
+
+        settings_btn = _small_btn("⚙", "Settings: scan keywords, alert words")
+        settings_btn.clicked.connect(self._show_settings)
+        tb_layout.addWidget(settings_btn)
         tb_layout.addSpacing(8)
 
         kill_btn = QPushButton("KILL ALL")
@@ -1324,6 +1451,18 @@ class BotWall(QMainWindow):
         main_layout.addWidget(self._minimized_shelf)
         self.setCentralWidget(central)
 
+        # ---- Keyboard zoom (mirrors the toolbar buttons) ----
+        for seq in ("Ctrl+=", "Ctrl++"):
+            QShortcut(QKeySequence(seq), self).activated.connect(
+                lambda: self._grid_view.zoom(ZOOM_FACTOR)
+            )
+        QShortcut(QKeySequence("Ctrl+-"), self).activated.connect(
+            lambda: self._grid_view.zoom(1.0 / ZOOM_FACTOR)
+        )
+        QShortcut(QKeySequence("Ctrl+0"), self).activated.connect(
+            lambda: self._grid_view.set_card_size(CARD_W_DEFAULT, CARD_H_DEFAULT)
+        )
+
     # ------------------------------------------------------------------
     # Tray icon + event log + alerts
     # ------------------------------------------------------------------
@@ -1344,18 +1483,27 @@ class BotWall(QMainWindow):
         if len(self._events) > 500:
             del self._events[:-500]
 
-    def _alert_client_closed(self, title: str):
-        self._log_event(f"Client closed: {title}")
+    def _alert(self, heading: str, detail: str):
+        """Audible + visual notification: beep, taskbar flash, tray toast."""
         try:
             winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
         except Exception:
             pass
         QApplication.alert(self)  # flash the taskbar entry
         if self._tray.isVisible() and QSystemTrayIcon.supportsMessages():
-            self._tray.showMessage(
-                "BotWall — client closed", title,
-                QSystemTrayIcon.Warning, 5000
-            )
+            self._tray.showMessage(heading, detail, QSystemTrayIcon.Warning, 5000)
+
+    def _alert_client_closed(self, title: str):
+        self._log_event(f"Client closed: {title}")
+        self._alert("BotWall — client closed", title)
+
+    def _check_alert_words(self, title: str):
+        tl = title.lower()
+        for word in self._alert_words:
+            if word and word in tl:
+                self._log_event(f'Alert word "{word}" in title: {title}')
+                self._alert(f'BotWall — "{word}"', title)
+                return
 
     def _show_log(self):
         dlg = QDialog(self)
@@ -1373,6 +1521,57 @@ class BotWall(QMainWindow):
         txt.verticalScrollBar().setValue(txt.verticalScrollBar().maximum())
         layout.addWidget(txt)
         dlg.exec_()
+
+    def _show_settings(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("BotWall — Settings")
+        dlg.setMinimumWidth(460)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background: {BG_COLOR}; }}
+            QLabel {{ color: {TEXT_COLOR}; font-size: 12px; }}
+            QLineEdit {{
+                background: {CARD_COLOR}; color: {TEXT_COLOR};
+                border: 1px solid {DIM_COLOR}; border-radius: 3px;
+                padding: 4px; font-size: 12px;
+            }}
+        """)
+        form = QFormLayout(dlg)
+
+        kw_edit = QLineEdit(", ".join(self._scan_keywords))
+        kw_edit.setToolTip("Window-title keywords that make a window count as a client")
+        form.addRow("Title keywords:", kw_edit)
+
+        alert_edit = QLineEdit(", ".join(self._alert_words))
+        alert_edit.setToolTip(
+            "If a client's title CHANGES and contains one of these words, "
+            "BotWall beeps and shows a toast (e.g. \"login, stopped, error\")"
+        )
+        form.addRow("Alert words:", alert_edit)
+
+        hint = QLabel("Comma-separated, case-insensitive. Keywords apply on the next scan.")
+        hint.setStyleSheet(f"color: {DIM_COLOR}; font-size: 11px;")
+        form.addRow(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self._scan_keywords = [
+            w.strip().lower() for w in kw_edit.text().split(",") if w.strip()
+        ] or list(KEYWORDS)
+        self._alert_words = [
+            w.strip().lower() for w in alert_edit.text().split(",") if w.strip()
+        ]
+        self._scanner.set_keywords(self._scan_keywords)
+        self._settings.setValue("scan_keywords", self._scan_keywords)
+        self._settings.setValue("alert_words", self._alert_words)
+        self._log_event(
+            f"Settings updated — keywords: {', '.join(self._scan_keywords)}"
+            + (f"; alert words: {', '.join(self._alert_words)}" if self._alert_words else "")
+        )
 
     # ------------------------------------------------------------------
     # Threading
@@ -1401,6 +1600,8 @@ class BotWall(QMainWindow):
         # Shelved cards are hidden — stop capturing them
         self._grid_view.client_minimized.connect(lambda *_: self._push_capture_hwnds())
         self._grid_view.client_kill_requested.connect(self._on_kill_client)
+        self._grid_view.client_restart_requested.connect(self._on_restart_client_proc)
+        self._grid_view.nicknames_changed.connect(self._save_nicknames)
 
     def _update_self_stats(self):
         try:
@@ -1425,10 +1626,25 @@ class BotWall(QMainWindow):
         self._grid_view.check_feeds()
         self._push_capture_hwnds()
         # Push live stats into minimized shelf strips
-        for hwnd, title, pid, proc_name, cpu_pct, mem_mb in clients:
+        for hwnd, title, pid, proc_name, cpu_pct, mem_mb, uptime_s in clients:
             self._minimized_shelf.update_stats(hwnd, cpu_pct, mem_mb)
         n = len(clients)
-        self._count_lbl.setText(f"{n} client{'s' if n != 1 else ''}")
+
+        # Aggregate farm load across unique processes
+        per_pid = {c[2]: (c[4], c[5]) for c in clients if c[2]}
+        total_cpu = sum(v[0] for v in per_pid.values())
+        total_mem = sum(v[1] for v in per_pid.values())
+        mem_txt = (f"{total_mem / 1024:.1f}GB" if total_mem >= 1024
+                   else f"{total_mem:.0f}MB")
+        if n:
+            self._count_lbl.setText(
+                f"{n} client{'s' if n != 1 else ''} · ΣCPU {total_cpu:.0f}% · ΣRAM {mem_txt}"
+            )
+        else:
+            self._count_lbl.setText("0 clients")
+        self._count_lbl.setToolTip(
+            "Detected clients · combined CPU (% of machine) and RAM of their processes"
+        )
 
         # Track client opens, closes, and title changes
         new_hwnd_titles = {c[0]: c[1] for c in clients}
@@ -1443,6 +1659,7 @@ class BotWall(QMainWindow):
                     f'Title changed: "{self._active_hwnds[hwnd]}" → "{title}"'
                 )
                 self._active_hwnds[hwnd] = title
+                self._check_alert_words(title)
         for hwnd in set(self._active_hwnds) - set(new_hwnd_titles):
             old_title = self._active_hwnds.pop(hwnd)
             self._total_closes += 1
@@ -1505,6 +1722,25 @@ class BotWall(QMainWindow):
             pinned = [pinned]
         self._grid_view.set_pinned_titles(set(pinned))
 
+        def _str_list(key: str) -> list[str]:
+            v = s.value(key, []) or []
+            return [v] if isinstance(v, str) else list(v)
+
+        kw = _str_list("scan_keywords")
+        if kw:
+            self._scan_keywords = kw
+            self._scanner.set_keywords(kw)
+        self._alert_words = _str_list("alert_words")
+        try:
+            self._grid_view.set_nicknames(json.loads(s.value("nicknames", "{}")))
+        except (TypeError, ValueError):
+            pass
+
+    def _save_nicknames(self):
+        self._settings.setValue(
+            "nicknames", json.dumps(self._grid_view.nicknames())
+        )
+
     def _save_settings(self):
         s = self._settings
         s.setValue("geometry", self.saveGeometry())
@@ -1514,6 +1750,9 @@ class BotWall(QMainWindow):
         s.setValue("sort_index", self._sort_combo.currentIndex())
         s.setValue("cpu_mode", "low" if self._low_cpu_active else "high")
         s.setValue("pinned_titles", sorted(self._grid_view.pinned_titles()))
+        s.setValue("nicknames", json.dumps(self._grid_view.nicknames()))
+        s.setValue("scan_keywords", self._scan_keywords)
+        s.setValue("alert_words", self._alert_words)
 
     # ------------------------------------------------------------------
     # Maximize / Restore all
@@ -1561,6 +1800,53 @@ class BotWall(QMainWindow):
             self._log_event(f"Killed client: {title} (PID {pid})")
         except Exception:
             self._log_event(f"Failed to kill PID {pid} ({title})")
+
+    def _on_restart_client_proc(self, pid: int, title: str, proc_name: str):
+        if not pid:
+            return
+        try:
+            proc = psutil.Process(pid)
+            cmdline = proc.cmdline()
+            try:
+                cwd = proc.cwd()
+            except Exception:
+                cwd = None
+        except Exception:
+            QMessageBox.warning(
+                self, "Restart Client",
+                f"Can't read the launch command of PID {pid} — restart unavailable."
+            )
+            return
+        if not cmdline:
+            QMessageBox.warning(
+                self, "Restart Client",
+                f"PID {pid} has no readable command line — restart unavailable."
+            )
+            return
+        reply = QMessageBox.question(
+            self, "Restart Client",
+            f'Restart "{title}"?\n'
+            f"Process {proc_name} (PID {pid}) will be killed and relaunched with "
+            "its original command line.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            proc.kill()
+            proc.wait(5)
+        except Exception:
+            pass
+        try:
+            subprocess.Popen(cmdline, cwd=cwd)
+            self._log_event(f"Restarted client: {title} (was PID {pid})")
+        except Exception as e:
+            self._log_event(f"Restart failed for {title}: {e}")
+            QMessageBox.warning(
+                self, "Restart Client",
+                f"Killed PID {pid} but relaunch failed:\n{e}"
+            )
 
     def _kill_all(self):
         pids = self._grid_view.all_pids()
