@@ -1,10 +1,13 @@
 # BotWall
 
-A live screenshot monitor for DreamBot and RuneScape clients on Windows. View all your running clients in a single dashboard with real-time screen capture, CPU/memory stats, and quick window management.
+A live screenshot monitor for DreamBot, TwiLite, and RuneScape clients on Windows. View all your running clients in a single dashboard with real-time screen capture, CPU/memory stats, and quick window management.
 
 ## Features
 
-- **Live screen capture** of all detected DreamBot / RuneScape windows
+- **Live screen capture** of all detected DreamBot / TwiLite / RuneScape windows
+- **Navigation tabs** — filter the wall by client type (All / DreamBot / TwiLite / …); KILL ALL and Maximize/Restore All apply to the active tab only
+- **Script filter** — narrow DreamBot clients by the script in their title (e.g. P2P Master AI vs MaxTutorialIsland)
+- **Per-tab zoom** — each tab remembers its own card size
 - **Real-time stats** — CPU usage, memory, process name per client
 - **Grid layout** with dynamic column sizing and Ctrl+Scroll zoom
 - **Sort clients** by title, CPU, memory, or PID
@@ -38,12 +41,14 @@ pip install -r requirements.txt
 python botwall.py
 ```
 
-BotWall will automatically detect visible windows with "dreambot", "runescape", or "oldschool runescape" in the title and begin capturing screenshots.
+BotWall will automatically detect visible windows with "dreambot", "twilite", or "runescape" in the title (configurable in ⚙ settings) and begin capturing screenshots. Each client is classified as DreamBot, TwiLite, RuneLite, or Other, and the tab bar under the toolbar filters the wall by type.
 
 ### Controls
 
 | Action | How |
 |--------|-----|
+| Filter by client type | Tabs under the toolbar (All / DreamBot / TwiLite / …) |
+| Filter DreamBot by script | Script dropdown at the right of the tab bar |
 | Zoom in/out | Ctrl + Scroll |
 | Sort clients | Dropdown in toolbar |
 | Pin a client | Click the pin button on the card header |

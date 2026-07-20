@@ -6,6 +6,7 @@ Requires: PyQt5, pywin32, psutil (Python 3.10+)
 from __future__ import annotations
 
 import sys
+import re
 import json
 import time
 import zlib
@@ -60,13 +61,26 @@ DIM_COLOR       = "#607080"
 ACCENT_TEAL     = "#3dc8d8"
 ACCENT_RED      = "#df4545"
 
-KEYWORDS = ("dreambot", "runescape")
+KEYWORDS = ("dreambot", "runescape", "twilite")
 
 # A window only counts as a client if its process also looks like one.
 # Without this, a browser tab titled "RuneScape Wiki" gets a card — and
 # gets its process terminated by KILL ALL.
 BOT_PROC_NAMES    = ("java.exe", "javaw.exe")
-BOT_PROC_KEYWORDS = ("dreambot", "runelite", "osclient", "jagex")
+BOT_PROC_KEYWORDS = ("dreambot", "runelite", "osclient", "jagex", "twilite")
+
+# Client kinds drive the navigation tabs. A window is classified by the
+# first kind whose keyword appears in its title or process name; anything
+# that passes the scan filters but matches no kind lands in "Other".
+# DreamBot and TwiLite always get a tab; the rest only when populated.
+CLIENT_KINDS = ("DreamBot", "TwiLite", "RuneLite")
+KIND_KEYWORDS = {
+    "DreamBot": ("dreambot",),
+    "TwiLite":  ("twilite",),
+    "RuneLite": ("runelite",),
+}
+OTHER_KIND = "Other"
+ALWAYS_SHOWN_KINDS = ("DreamBot", "TwiLite")
 
 NUM_CORES = psutil.cpu_count() or 1
 
@@ -82,6 +96,29 @@ def _is_interesting(title: str, keywords=KEYWORDS) -> bool:
 def _is_bot_process(proc_name: str) -> bool:
     nl = proc_name.lower()
     return nl in BOT_PROC_NAMES or any(kw in nl for kw in BOT_PROC_KEYWORDS)
+
+
+def _client_kind(title: str, proc_name: str) -> str:
+    """Classify a client window for the navigation tabs."""
+    haystack = f"{title} {proc_name}".lower()
+    for kind in CLIENT_KINDS:
+        if any(kw in haystack for kw in KIND_KEYWORDS[kind]):
+            return kind
+    return OTHER_KIND
+
+
+# DreamBot titles read "DreamBot <ver> - <email> - <Script> v<n> - <ip> [- flag]",
+# so the running script is the 3rd " - " segment with its version stripped. The
+# version is dropped so v2.156 and v2.157 of the same script group together.
+_SCRIPT_VER_RE = re.compile(r"\s+v\d[\d.]*$")
+
+
+def _parse_script(title: str) -> str:
+    """Script name from a DreamBot title, or "" if none (launcher, TwiLite…)."""
+    parts = [p.strip() for p in title.split(" - ")]
+    if len(parts) >= 3 and parts[0].lower().startswith("dreambot"):
+        return _SCRIPT_VER_RE.sub("", parts[2]).strip()
+    return ""
 
 
 def _fmt_age(seconds: float) -> str:
@@ -362,6 +399,8 @@ class ClientCard(QFrame):
         self.pid = pid
         self.proc_name = proc_name
         self.title = title
+        self.kind = _client_kind(title, proc_name)
+        self.script = _parse_script(title)
         self.nickname = ""
         self._cpu_pct = cpu_pct
         self._mem_mb  = mem_mb
@@ -520,6 +559,8 @@ class ClientCard(QFrame):
         self.pid = pid
         self.proc_name = proc_name
         self.title = title
+        self.kind = _client_kind(title, proc_name)
+        self.script = _parse_script(title)
         self._uptime_s = uptime_s
         self._update_labels()
         self._update_stats(cpu_pct, mem_mb)
@@ -572,7 +613,11 @@ class ClientCard(QFrame):
         self._pixmap_raw = pixmap
         self._last_frame_ts = time.monotonic()
         self._set_freshness(age_s)
-        self._rescale()
+        # Cards on an inactive tab keep receiving frames (freeze detection
+        # stays farm-wide) but there's no point scaling pixmaps nobody sees —
+        # showEvent below catches up when the tab becomes active.
+        if self.isVisible():
+            self._rescale()
 
     # ------------------------------------------------------------------
     # Freshness / freeze indication
@@ -642,6 +687,12 @@ class ClientCard(QFrame):
         super().resizeEvent(event)
         self._rescale()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Fixed-size cards get no resizeEvent on re-show, so scale the last
+        # frame received while the card was hidden on an inactive tab.
+        self._rescale()
+
 
 # ---------------------------------------------------------------------------
 # Empty-state placeholder
@@ -651,14 +702,20 @@ class EmptyPlaceholder(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
-        lbl = QLabel("No DreamBot clients detected")
-        lbl.setAlignment(Qt.AlignCenter)
-        lbl.setStyleSheet(f"color: {DIM_COLOR}; font-size: 15px;")
-        layout.addWidget(lbl)
-        sub = QLabel("Launch DreamBot and accounts will appear here automatically.")
+        self._lbl = QLabel()
+        self._lbl.setAlignment(Qt.AlignCenter)
+        self._lbl.setStyleSheet(f"color: {DIM_COLOR}; font-size: 15px;")
+        layout.addWidget(self._lbl)
+        sub = QLabel("Launch a client and it will appear here automatically.")
         sub.setAlignment(Qt.AlignCenter)
         sub.setStyleSheet(f"color: {DIM_COLOR}; font-size: 11px;")
         layout.addWidget(sub)
+        self.set_kind(None)
+
+    def set_kind(self, kind: str | None):
+        """Match the empty-state text to the active tab."""
+        self._lbl.setText(f"No {kind} clients detected" if kind
+                          else "No clients detected")
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +927,8 @@ class GridView(QScrollArea):
         self._minimized: set[int] = set()               # minimized hwnds
         self._stats: dict[int, tuple[float, float]] = {}# hwnd → (cpu_pct, mem_mb)
         self._sort_mode = "default"
+        self._filter_kind: str | None = None            # None = All tab
+        self._filter_script: str | None = None          # None = all scripts
         self._placeholder: EmptyPlaceholder | None = None
         self._low_cpu = False
         self._last_layout: tuple | None = None      # skip no-op relayouts
@@ -926,9 +985,36 @@ class GridView(QScrollArea):
                 )
 
         self._relayout()
+        self._update_placeholder()
 
-        visible = len(self._cards) - len(self._minimized)
-        if visible > 0:
+    def set_filter_kind(self, kind: str | None):
+        """Show only cards of one client kind (None = all). Filtered-out
+        clients keep their captures and freeze detection — only display
+        changes."""
+        if kind == self._filter_kind:
+            return
+        self._filter_kind = kind
+        self._last_layout = None  # visibility changes even if order matches
+        self._relayout()
+        self._update_placeholder()
+
+    def set_filter_script(self, script: str | None):
+        """Show only cards running one script (None = all). Display-only,
+        same as set_filter_kind — captures keep running for hidden cards."""
+        if script == self._filter_script:
+            return
+        self._filter_script = script
+        self._last_layout = None
+        self._relayout()
+        self._update_placeholder()
+
+    def _matches_filter(self, card: ClientCard) -> bool:
+        return ((self._filter_kind is None or card.kind == self._filter_kind)
+                and (self._filter_script is None
+                     or card.script == self._filter_script))
+
+    def _update_placeholder(self):
+        if self._sorted_order():
             self._hide_placeholder()
         else:
             self._show_placeholder()
@@ -1017,24 +1103,24 @@ class GridView(QScrollArea):
             cpu_pct, mem_mb = self._stats.get(hwnd, (0.0, 0.0))
             self.client_minimized.emit(hwnd, card.title, card.pid, cpu_pct, mem_mb)
             self._relayout()
-            visible = len(self._cards) - len(self._minimized)
-            if visible == 0:
-                self._show_placeholder()
+            self._update_placeholder()
 
     def restore_client(self, hwnd: int):
         if hwnd in self._minimized:
             self._minimized.discard(hwnd)
-            card = self._cards[hwnd]
-            card.show()
-            self._hide_placeholder()
+            # _relayout shows the card — unless it belongs to another tab,
+            # in which case it stays hidden until that tab is selected.
+            self._last_layout = None
             self._relayout()
+            self._update_placeholder()
 
     def set_sort_mode(self, mode: str):
         self._sort_mode = mode
         self._relayout()
 
     def _sorted_order(self) -> list[int]:
-        visible  = [h for h in self._order if h not in self._minimized]
+        visible  = [h for h in self._order if h not in self._minimized
+                    and self._matches_filter(self._cards[h])]
         pinned   = [h for h in visible if h in self._pinned]
         unpinned = [h for h in visible if h not in self._pinned]
         if self._sort_mode != "default":
@@ -1060,9 +1146,17 @@ class GridView(QScrollArea):
             return lambda h: -int(self._stats.get(h, (0.0, 0.0))[1] // 200)
         return lambda h: 0
 
-    def all_pids(self) -> list[int]:
-        # Deduplicated: one process can own several client windows
-        return sorted({c.pid for c in self._cards.values() if c.pid})
+    def all_pids(self, kind: str | None = None,
+                 script: str | None = None) -> list[int]:
+        # Deduplicated: one process can own several client windows.
+        # kind/script narrow the set so KILL ALL matches what's on screen
+        # (active tab + script dropdown).
+        return sorted({
+            c.pid for c in self._cards.values()
+            if c.pid
+            and (kind is None or c.kind == kind)
+            and (script is None or c.script == script)
+        })
 
     def minimized_hwnds(self) -> set[int]:
         return set(self._minimized)
@@ -1096,6 +1190,15 @@ class GridView(QScrollArea):
             row, col = divmod(idx, cols)
             self._grid.addWidget(card, row, col)
 
+        # Cards filtered out by the active tab were pulled from the layout
+        # above but would still paint parented at the container's origin —
+        # hide them; show cards (re-)entering the visible set.
+        shown = set(display_order)
+        for hwnd, card in self._cards.items():
+            if hwnd in self._minimized:
+                continue  # shelf handles these
+            card.setVisible(hwnd in shown)
+
         # Clear the previous stretch before setting the new one, or stale
         # stretches accumulate and split the free space with phantom rows/cols
         old_row, old_col = self._last_stretch
@@ -1110,6 +1213,7 @@ class GridView(QScrollArea):
         if self._placeholder is None:
             self._placeholder = EmptyPlaceholder()
             self._grid.addWidget(self._placeholder, 0, 0)
+        self._placeholder.set_kind(self._filter_kind)
 
     def _hide_placeholder(self):
         if self._placeholder is not None:
@@ -1152,6 +1256,9 @@ class BotWall(QMainWindow):
         self._alert_words: list[str] = []
         self._scan_keywords: list[str] = list(KEYWORDS)
         self._low_cpu_active = False
+        self._active_kind: str | None = None       # None = "All" tab
+        self._kind_counts: dict[str, int] = {}      # kind → client count
+        self._card_sizes: dict[str, tuple[int, int]] = {}  # tab ("" = All) → (w, h)
         self._self_proc = psutil.Process()
         self._self_proc.cpu_percent(interval=None)  # prime the baseline
         self._settings = QSettings("BotWall", "BotWall")
@@ -1225,7 +1332,7 @@ class BotWall(QMainWindow):
 
         self._count_lbl = QLabel("0 clients")
         self._count_lbl.setStyleSheet(f"color: {DIM_COLOR}; font-size: 12px;")
-        self._count_lbl.setToolTip("Active DreamBot clients detected")
+        self._count_lbl.setToolTip("Active bot clients detected")
         tb_layout.addWidget(self._count_lbl)
 
         tb_layout.addStretch()
@@ -1367,7 +1474,7 @@ class BotWall(QMainWindow):
             QPushButton:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
             QPushButton:pressed {{ background: #1a3a40; }}
         """)
-        maximize_all_btn.setToolTip("Maximize all DreamBot windows")
+        maximize_all_btn.setToolTip("Maximize all client windows in the current tab")
         maximize_all_btn.clicked.connect(self._maximize_all)
         tb_layout.addWidget(maximize_all_btn)
 
@@ -1387,7 +1494,7 @@ class BotWall(QMainWindow):
             QPushButton:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
             QPushButton:pressed {{ background: #1a3a40; }}
         """)
-        restore_all_btn.setToolTip("Restore all DreamBot windows")
+        restore_all_btn.setToolTip("Restore all client windows in the current tab")
         restore_all_btn.clicked.connect(self._restore_all)
         tb_layout.addWidget(restore_all_btn)
 
@@ -1431,8 +1538,68 @@ class BotWall(QMainWindow):
             QPushButton:hover {{ background: #f05555; }}
             QPushButton:pressed {{ background: #c03535; }}
         """)
+        kill_btn.setToolTip("Kill every client process in the current tab")
         kill_btn.clicked.connect(self._kill_all)
         tb_layout.addWidget(kill_btn)
+
+        # ---- Client-type tabs (All / DreamBot / TwiLite / …) ----
+        tabs_widget = QWidget()
+        tabs_widget.setFixedHeight(36)
+        tabs_widget.setStyleSheet(f"background: {TOOLBAR_COLOR};")
+        tabs_layout = QHBoxLayout(tabs_widget)
+        tabs_layout.setContentsMargins(12, 0, 12, 6)
+        tabs_layout.setSpacing(6)
+
+        self._tab_buttons: dict[str | None, QPushButton] = {}
+
+        def _make_tab(kind: str | None):
+            b = QPushButton(kind or "All")
+            b.setFixedHeight(26)
+            b.setCursor(QCursor(Qt.PointingHandCursor))
+            b.clicked.connect(lambda _, k=kind: self._set_active_kind(k))
+            tabs_layout.addWidget(b)
+            self._tab_buttons[kind] = b
+
+        _make_tab(None)
+        for kind in (*CLIENT_KINDS, OTHER_KIND):
+            _make_tab(kind)
+        tabs_layout.addStretch()
+
+        # ---- Script filter (DreamBot clients run different scripts) ----
+        self._script_lbl = QLabel("Script:")
+        self._script_lbl.setStyleSheet(f"color: {DIM_COLOR}; font-size: 11px;")
+        tabs_layout.addWidget(self._script_lbl)
+
+        self._script_combo = QComboBox()
+        self._script_combo.setFixedHeight(24)
+        self._script_combo.setMinimumWidth(150)
+        self._script_combo.setCursor(QCursor(Qt.PointingHandCursor))
+        self._script_combo.setToolTip("Filter DreamBot clients by the script in their title")
+        self._script_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: transparent;
+                color: {DIM_COLOR};
+                border: 1px solid {DIM_COLOR};
+                border-radius: 3px;
+                font-size: 11px;
+                padding: 0 4px;
+            }}
+            QComboBox:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
+            QComboBox::drop-down {{ border: none; width: 16px; }}
+            QComboBox QAbstractItemView {{
+                background: #1a1a2e;
+                color: {TEXT_COLOR};
+                border: 1px solid {DIM_COLOR};
+                selection-background-color: {HEADER_COLOR};
+            }}
+        """)
+        self._script_combo.currentIndexChanged.connect(self._on_script_changed)
+        tabs_layout.addWidget(self._script_combo)
+        # Hidden until a scan finds DreamBot clients with parseable scripts
+        self._script_lbl.setVisible(False)
+        self._script_combo.setVisible(False)
+
+        self._refresh_tabs()
 
         # ---- Grid view ----
         self._grid_view = GridView()
@@ -1447,6 +1614,7 @@ class BotWall(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         main_layout.addWidget(toolbar_widget)
+        main_layout.addWidget(tabs_widget)
         main_layout.addWidget(self._grid_view)
         main_layout.addWidget(self._minimized_shelf)
         self.setCentralWidget(central)
@@ -1462,6 +1630,115 @@ class BotWall(QMainWindow):
         QShortcut(QKeySequence("Ctrl+0"), self).activated.connect(
             lambda: self._grid_view.set_card_size(CARD_W_DEFAULT, CARD_H_DEFAULT)
         )
+
+    # ------------------------------------------------------------------
+    # Client-type tabs
+    # ------------------------------------------------------------------
+    def _tab_btn_style(self, active: bool) -> str:
+        if active:
+            return f"""
+                QPushButton {{
+                    background: {HEADER_COLOR};
+                    color: {TEXT_COLOR};
+                    border: 1px solid {ACCENT_TEAL};
+                    border-radius: 3px;
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 0 12px;
+                }}
+            """
+        return f"""
+            QPushButton {{
+                background: transparent;
+                color: {DIM_COLOR};
+                border: 1px solid transparent;
+                border-radius: 3px;
+                font-size: 11px;
+                padding: 0 12px;
+            }}
+            QPushButton:hover {{ color: {TEXT_COLOR}; border-color: {DIM_COLOR}; }}
+        """
+
+    def _set_active_kind(self, kind: str | None):
+        self._active_kind = kind
+        self._grid_view.set_filter_kind(kind)
+        self._apply_tab_zoom()
+        self._refresh_tabs()
+        # Scripts differ per tab, so start each tab unfiltered
+        self._refresh_script_filter(reset=True)
+
+    def _apply_tab_zoom(self):
+        """Load the active tab's saved card size (per-tab zoom)."""
+        w, h = self._card_sizes.get(self._active_kind or "",
+                                    (CARD_W_DEFAULT, CARD_H_DEFAULT))
+        self._grid_view.set_card_size(w, h)
+
+    def _on_card_size_changed(self, w: int, h: int):
+        """Zoom changed (buttons/wheel/reset) — remember it for this tab."""
+        self._card_sizes[self._active_kind or ""] = (w, h)
+
+    def _refresh_script_filter(self, reset: bool = False):
+        """Repopulate the script dropdown from the clients on the active tab.
+
+        Only DreamBot titles carry a script, so the control is shown on the
+        DreamBot and All tabs and hidden otherwise. Preserves the current
+        selection across scans unless `reset` (used on tab switch)."""
+        combo = self._script_combo
+        scripts = sorted({
+            _parse_script(c[1]) for c in self._clients
+            if _parse_script(c[1])
+            and (self._active_kind is None
+                 or _client_kind(c[1], c[3]) == self._active_kind)
+        })
+        show = self._active_kind in (None, "DreamBot") and bool(scripts)
+        self._script_lbl.setVisible(show)
+        combo.setVisible(show)
+        if not show:
+            self._grid_view.set_filter_script(None)
+            return
+
+        prev = None if reset else combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("All Scripts", None)
+        for name in scripts:
+            combo.addItem(name, name)
+        idx = combo.findData(prev) if prev is not None else 0
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+        self._grid_view.set_filter_script(combo.currentData())
+
+    def _on_script_changed(self, _idx: int):
+        self._grid_view.set_filter_script(self._script_combo.currentData())
+
+    def _refresh_tabs(self):
+        """Update tab labels/counts, highlight the active one, and hide
+        never-populated optional kinds (DreamBot/TwiLite tabs always show)."""
+        total = sum(self._kind_counts.values())
+        for kind, btn in self._tab_buttons.items():
+            active = kind == self._active_kind
+            if kind is None:
+                btn.setText(f"All ({total})")
+            else:
+                count = self._kind_counts.get(kind, 0)
+                btn.setText(f"{kind} ({count})")
+                btn.setVisible(
+                    kind in ALWAYS_SHOWN_KINDS or count > 0 or active
+                )
+            btn.setStyleSheet(self._tab_btn_style(active))
+
+    def _tab_clients(self) -> list[tuple]:
+        """Scanner tuples currently shown (active tab + script dropdown)."""
+        kind = self._active_kind
+        script = self._script_combo.currentData()
+        out = []
+        for c in self._clients:
+            if kind is not None and _client_kind(c[1], c[3]) != kind:
+                continue
+            if script is not None and _parse_script(c[1]) != script:
+                continue
+            out.append(c)
+        return out
 
     # ------------------------------------------------------------------
     # Tray icon + event log + alerts
@@ -1483,19 +1760,30 @@ class BotWall(QMainWindow):
         if len(self._events) > 500:
             del self._events[:-500]
 
-    def _alert(self, heading: str, detail: str):
-        """Audible + visual notification: beep, taskbar flash, tray toast."""
-        try:
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-        except Exception:
-            pass
-        QApplication.alert(self)  # flash the taskbar entry
+    def _alert(self, heading: str, detail: str, *,
+               flash: bool = True, beep: bool = True):
+        """Notification: optional beep + taskbar flash, plus a tray toast.
+
+        flash/beep are opt-out so routine events (a client closing) can post a
+        quiet toast without the taskbar constantly blinking orange, while
+        user-chosen alert words still get the full attention-grabbing treatment.
+        """
+        if beep:
+            try:
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+        if flash:
+            QApplication.alert(self)  # flash the taskbar entry
         if self._tray.isVisible() and QSystemTrayIcon.supportsMessages():
             self._tray.showMessage(heading, detail, QSystemTrayIcon.Warning, 5000)
 
     def _alert_client_closed(self, title: str):
         self._log_event(f"Client closed: {title}")
-        self._alert("BotWall — client closed", title)
+        # Clients opening/closing is normal farm churn (restarts, world hops),
+        # so keep it quiet — toast only, no beep or taskbar flash. The event
+        # log still records every close.
+        self._alert("BotWall — client closed", title, flash=False, beep=False)
 
     def _check_alert_words(self, title: str):
         tl = title.lower()
@@ -1585,6 +1873,7 @@ class BotWall(QMainWindow):
         self._capturer.captured.connect(self._on_capture)
         self._capturer.set_card_size(*self._grid_view.card_size())
         self._grid_view.card_size_changed.connect(self._capturer.set_card_size)
+        self._grid_view.card_size_changed.connect(self._on_card_size_changed)
         self._capturer.start()
 
         # Self-stats refresh timer
@@ -1622,6 +1911,13 @@ class BotWall(QMainWindow):
 
     def _on_scan(self, clients: list):
         self._clients = clients
+        counts: dict[str, int] = {}
+        for c in clients:
+            kind = _client_kind(c[1], c[3])
+            counts[kind] = counts.get(kind, 0) + 1
+        self._kind_counts = counts
+        self._refresh_tabs()
+        self._refresh_script_filter()
         self._grid_view.update_clients(clients)
         self._grid_view.check_feeds()
         self._push_capture_hwnds()
@@ -1703,12 +1999,23 @@ class BotWall(QMainWindow):
         geo = s.value("geometry")
         if geo is not None:
             self.restoreGeometry(geo)
+        # Per-tab zoom: {tab ("" = All): [w, h]}. Migrate the legacy single
+        # card_w/card_h into the All slot for installs from before per-tab zoom.
+        self._card_sizes = {}
         try:
-            card_w = int(s.value("card_w", CARD_W_DEFAULT))
-            card_h = int(s.value("card_h", CARD_H_DEFAULT))
-        except (TypeError, ValueError):
-            card_w, card_h = CARD_W_DEFAULT, CARD_H_DEFAULT
-        self._grid_view.set_card_size(card_w, card_h)
+            for k, v in json.loads(s.value("card_sizes", "{}")).items():
+                self._card_sizes[k] = (int(v[0]), int(v[1]))
+        except (TypeError, ValueError, IndexError):
+            self._card_sizes = {}
+        if "" not in self._card_sizes:
+            try:
+                self._card_sizes[""] = (
+                    int(s.value("card_w", CARD_W_DEFAULT)),
+                    int(s.value("card_h", CARD_H_DEFAULT)),
+                )
+            except (TypeError, ValueError):
+                self._card_sizes[""] = (CARD_W_DEFAULT, CARD_H_DEFAULT)
+        self._apply_tab_zoom()  # active tab is still All here
         try:
             sort_idx = int(s.value("sort_index", 0))
         except (TypeError, ValueError):
@@ -1728,6 +2035,10 @@ class BotWall(QMainWindow):
 
         kw = _str_list("scan_keywords")
         if kw:
+            if sorted(kw) == ["dreambot", "runescape"]:
+                # Pre-tabs default was persisted verbatim — upgrade it so
+                # TwiLite clients are detected. Customized lists are kept.
+                kw = list(KEYWORDS)
             self._scan_keywords = kw
             self._scanner.set_keywords(kw)
         self._alert_words = _str_list("alert_words")
@@ -1735,6 +2046,9 @@ class BotWall(QMainWindow):
             self._grid_view.set_nicknames(json.loads(s.value("nicknames", "{}")))
         except (TypeError, ValueError):
             pass
+        kind = s.value("active_kind", "") or ""
+        if kind in (*CLIENT_KINDS, OTHER_KIND):
+            self._set_active_kind(kind)
 
     def _save_nicknames(self):
         self._settings.setValue(
@@ -1744,7 +2058,13 @@ class BotWall(QMainWindow):
     def _save_settings(self):
         s = self._settings
         s.setValue("geometry", self.saveGeometry())
-        card_w, card_h = self._grid_view.card_size()
+        # Capture the active tab's current size, then persist the whole map
+        self._card_sizes[self._active_kind or ""] = self._grid_view.card_size()
+        s.setValue("card_sizes", json.dumps(
+            {k: list(v) for k, v in self._card_sizes.items()}
+        ))
+        # Legacy key kept so an older build still reads a sane size
+        card_w, card_h = self._card_sizes.get("", self._grid_view.card_size())
         s.setValue("card_w", card_w)
         s.setValue("card_h", card_h)
         s.setValue("sort_index", self._sort_combo.currentIndex())
@@ -1753,19 +2073,20 @@ class BotWall(QMainWindow):
         s.setValue("nicknames", json.dumps(self._grid_view.nicknames()))
         s.setValue("scan_keywords", self._scan_keywords)
         s.setValue("alert_words", self._alert_words)
+        s.setValue("active_kind", self._active_kind or "")
 
     # ------------------------------------------------------------------
     # Maximize / Restore all
     # ------------------------------------------------------------------
     def _maximize_all(self):
-        for hwnd, *_ in self._clients:
+        for hwnd, *_ in self._tab_clients():
             try:
                 win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
             except Exception:
                 pass
 
     def _restore_all(self):
-        for hwnd, *_ in self._clients:
+        for hwnd, *_ in self._tab_clients():
             try:
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             except Exception:
@@ -1849,15 +2170,22 @@ class BotWall(QMainWindow):
             )
 
     def _kill_all(self):
-        pids = self._grid_view.all_pids()
+        # Scoped to what's on screen: active tab + script dropdown. On the
+        # TwiLite tab it only touches TwiLite; with a script selected it only
+        # touches DreamBot clients running that script.
+        kind = self._active_kind
+        script = self._script_combo.currentData()
+        scope_parts = [p for p in (kind, script) if p]
+        scope = (" / ".join(scope_parts) + " client") if scope_parts else "client"
+        pids = self._grid_view.all_pids(kind, script)
         if not pids:
-            QMessageBox.information(self, "BotWall", "No clients to kill.")
+            QMessageBox.information(self, "BotWall", f"No {scope}s to kill.")
             return
         names = sorted({c[3] for c in self._clients if c[2] in pids and c[3]})
         name_line = f"Processes: {', '.join(names)}\n" if names else ""
         reply = QMessageBox.question(
             self, "Kill All",
-            f"Kill {len(pids)} client process{'es' if len(pids) != 1 else ''}?\n"
+            f"Kill {len(pids)} {scope} process{'es' if len(pids) != 1 else ''}?\n"
             f"{name_line}"
             "This will forcefully terminate them.",
             QMessageBox.Yes | QMessageBox.No,
@@ -1873,7 +2201,10 @@ class BotWall(QMainWindow):
                 killed += 1
             except Exception:
                 pass
-        self._log_event(f"KILL ALL: terminated {killed}/{len(pids)} processes")
+        self._log_event(
+            f"KILL ALL ({' / '.join(scope_parts) or 'All'}): "
+            f"terminated {killed}/{len(pids)} processes"
+        )
 
     # ------------------------------------------------------------------
     # Cleanup
