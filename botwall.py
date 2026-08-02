@@ -61,6 +61,38 @@ DIM_COLOR       = "#607080"
 ACCENT_TEAL     = "#3dc8d8"
 ACCENT_RED      = "#df4545"
 
+TB_SPACING        = 6    # toolbar inter-item gap
+TB_REFLOW_SLACK   = 8    # px of headroom before a toolbar group is dropped
+
+DISCORD_URL = "https://discord.gg/fEg3X3a5sh"
+
+COMBO_STYLE = f"""
+    QComboBox {{
+        background: transparent;
+        color: {DIM_COLOR};
+        border: 1px solid {DIM_COLOR};
+        border-radius: 3px;
+        font-size: 11px;
+        padding: 0 4px;
+    }}
+    QComboBox:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
+    QComboBox::drop-down {{ border: none; width: 16px; }}
+    QComboBox QAbstractItemView {{
+        background: #1a1a2e;
+        color: {TEXT_COLOR};
+        border: 1px solid {DIM_COLOR};
+        selection-background-color: {HEADER_COLOR};
+    }}
+"""
+
+MENU_STYLE = f"""
+    QMenu {{ background: #1a1a2e; color: {TEXT_COLOR}; border: 1px solid {DIM_COLOR}; }}
+    QMenu::item {{ padding: 4px 20px; }}
+    QMenu::item:selected {{ background: {HEADER_COLOR}; }}
+    QMenu::item:disabled {{ color: {DIM_COLOR}; }}
+    QMenu::separator {{ height: 1px; background: {DIM_COLOR}; margin: 4px 8px; }}
+"""
+
 KEYWORDS = ("dreambot", "runescape", "twilite")
 
 # A window only counts as a client if its process also looks like one.
@@ -1259,6 +1291,8 @@ class BotWall(QMainWindow):
         self._active_kind: str | None = None       # None = "All" tab
         self._kind_counts: dict[str, int] = {}      # kind → client count
         self._card_sizes: dict[str, tuple[int, int]] = {}  # tab ("" = All) → (w, h)
+        self._tb_measured = False  # toolbar chrome width known yet?
+        self._tb_fixed_w = 0       # width of the never-hidden toolbar chrome
         self._self_proc = psutil.Process()
         self._self_proc.cpu_percent(interval=None)  # prime the baseline
         self._settings = QSettings("BotWall", "BotWall")
@@ -1272,19 +1306,23 @@ class BotWall(QMainWindow):
     # ------------------------------------------------------------------
     def _setup_ui(self):
         # ---- Toolbar ----
-        toolbar_widget = QWidget()
+        # The toolbar is by far the widest thing in the window, so it is built
+        # as a row of collapsible *groups*. When the window gets too narrow,
+        # groups are hidden lowest-priority-first and their controls move into
+        # the ⋯ overflow menu; otherwise the layout's natural minimum (~1300 px)
+        # is a hard floor on how narrow the window can be dragged, which makes
+        # a half-monitor split impossible.
+        toolbar_widget = self._toolbar_widget = QWidget()
         toolbar_widget.setFixedHeight(54)
         toolbar_widget.setStyleSheet(f"background: {TOOLBAR_COLOR};")
+        # Qt clamps a resize at the layout's minimum, so without an explicit
+        # override the window would never get narrow enough for _reflow_toolbar
+        # to be asked to do anything.
+        toolbar_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        toolbar_widget.setMinimumWidth(0)
         tb_layout = QHBoxLayout(toolbar_widget)
         tb_layout.setContentsMargins(12, 0, 12, 0)
-        tb_layout.setSpacing(6)
-
-        title_lbl = QLabel("BotWall")
-        title_lbl.setStyleSheet(
-            f"color: {ACCENT_TEAL}; font-size: 18px; font-weight: bold; letter-spacing: 1px;"
-        )
-        tb_layout.addWidget(title_lbl)
-        tb_layout.addSpacing(10)
+        tb_layout.setSpacing(TB_SPACING)
 
         def _vsep():
             s = QFrame()
@@ -1293,79 +1331,6 @@ class BotWall(QMainWindow):
             s.setStyleSheet(f"color: {DIM_COLOR};")
             return s
 
-        tb_layout.addWidget(_vsep())
-        tb_layout.addSpacing(8)
-
-        # ---- BotWall self-stats ----
-        self._self_cpu_lbl = QLabel("CPU: –")
-        self._self_cpu_lbl.setStyleSheet("color: #5bbde8; font-size: 12px;")
-        self._self_cpu_lbl.setToolTip("BotWall CPU usage")
-        tb_layout.addWidget(self._self_cpu_lbl)
-
-        tb_layout.addSpacing(10)
-
-        self._self_mem_lbl = QLabel("MEM: –")
-        self._self_mem_lbl.setStyleSheet("color: #b07ed8; font-size: 12px;")
-        self._self_mem_lbl.setToolTip("BotWall memory usage")
-        tb_layout.addWidget(self._self_mem_lbl)
-
-        tb_layout.addSpacing(10)
-        tb_layout.addWidget(_vsep())
-        tb_layout.addSpacing(8)
-
-        # ---- Session client stats ----
-        self._opens_lbl = QLabel("↑ 0 Opened")
-        self._opens_lbl.setStyleSheet("color: #4dc87a; font-size: 12px;")
-        self._opens_lbl.setToolTip("Clients opened this session")
-        tb_layout.addWidget(self._opens_lbl)
-
-        tb_layout.addSpacing(10)
-
-        self._closes_lbl = QLabel("↓ 0 Closed")
-        self._closes_lbl.setStyleSheet("color: #e07050; font-size: 12px;")
-        self._closes_lbl.setToolTip("Clients closed this session")
-        tb_layout.addWidget(self._closes_lbl)
-
-        tb_layout.addSpacing(10)
-        tb_layout.addWidget(_vsep())
-        tb_layout.addSpacing(8)
-
-        self._count_lbl = QLabel("0 clients")
-        self._count_lbl.setStyleSheet(f"color: {DIM_COLOR}; font-size: 12px;")
-        self._count_lbl.setToolTip("Active bot clients detected")
-        tb_layout.addWidget(self._count_lbl)
-
-        tb_layout.addStretch()
-
-        # ---- Sort control ----
-        sort_combo = self._sort_combo = QComboBox()
-        sort_combo.addItems(["Sort: Default", "CPU ↑", "CPU ↓", "RAM ↑", "RAM ↓"])
-        sort_combo.setFixedHeight(28)
-        sort_combo.setFixedWidth(120)
-        sort_combo.setCursor(QCursor(Qt.PointingHandCursor))
-        sort_combo.setStyleSheet(f"""
-            QComboBox {{
-                background: transparent;
-                color: {DIM_COLOR};
-                border: 1px solid {DIM_COLOR};
-                border-radius: 3px;
-                font-size: 11px;
-                padding: 0 4px;
-            }}
-            QComboBox:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
-            QComboBox::drop-down {{ border: none; width: 16px; }}
-            QComboBox QAbstractItemView {{
-                background: #1a1a2e;
-                color: {TEXT_COLOR};
-                border: 1px solid {DIM_COLOR};
-                selection-background-color: {HEADER_COLOR};
-            }}
-        """)
-        sort_combo.currentIndexChanged.connect(self._on_sort_changed)
-        tb_layout.addWidget(sort_combo)
-        tb_layout.addSpacing(8)
-
-        # ---- Zoom controls (also available via Ctrl+wheel / Ctrl+= / Ctrl+- / Ctrl+0) ----
         def _small_btn(text: str, tip: str) -> QPushButton:
             b = QPushButton(text)
             b.setFixedSize(28, 28)
@@ -1382,9 +1347,107 @@ class BotWall(QMainWindow):
                 }}
                 QPushButton:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
                 QPushButton:pressed {{ background: #1a3a40; }}
+                QPushButton::menu-indicator {{ image: none; width: 0; }}
             """)
             return b
 
+        def _flat_btn(text: str, tip: str) -> QPushButton:
+            b = QPushButton(text)
+            b.setFixedHeight(28)
+            b.setCursor(QCursor(Qt.PointingHandCursor))
+            b.setToolTip(tip)
+            b.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent;
+                    color: {DIM_COLOR};
+                    border: 1px solid {DIM_COLOR};
+                    border-radius: 3px;
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 0 8px;
+                }}
+                QPushButton:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
+                QPushButton:pressed {{ background: #1a3a40; }}
+            """)
+            return b
+
+        def _group():
+            """A hide-as-one section of the toolbar."""
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(TB_SPACING)
+            return w, lay
+
+        title_lbl = QLabel("BotWall")
+        title_lbl.setStyleSheet(
+            f"color: {ACCENT_TEAL}; font-size: 18px; font-weight: bold; letter-spacing: 1px;"
+        )
+        tb_layout.addWidget(title_lbl)
+
+        # ---- Group: BotWall self-stats ----
+        g_stats, g_stats_lay = _group()
+        g_stats_lay.addSpacing(4)
+        g_stats_lay.addWidget(_vsep())
+        g_stats_lay.addSpacing(8)
+
+        self._self_cpu_lbl = QLabel("CPU: –")
+        self._self_cpu_lbl.setStyleSheet("color: #5bbde8; font-size: 12px;")
+        self._self_cpu_lbl.setToolTip("BotWall CPU usage")
+        g_stats_lay.addWidget(self._self_cpu_lbl)
+
+        g_stats_lay.addSpacing(10)
+
+        self._self_mem_lbl = QLabel("MEM: –")
+        self._self_mem_lbl.setStyleSheet("color: #b07ed8; font-size: 12px;")
+        self._self_mem_lbl.setToolTip("BotWall memory usage")
+        g_stats_lay.addWidget(self._self_mem_lbl)
+        tb_layout.addWidget(g_stats)
+
+        # ---- Group: session client stats ----
+        g_session, g_session_lay = _group()
+        g_session_lay.addSpacing(4)
+        g_session_lay.addWidget(_vsep())
+        g_session_lay.addSpacing(8)
+
+        self._opens_lbl = QLabel("↑ 0 Opened")
+        self._opens_lbl.setStyleSheet("color: #4dc87a; font-size: 12px;")
+        self._opens_lbl.setToolTip("Clients opened this session")
+        g_session_lay.addWidget(self._opens_lbl)
+
+        g_session_lay.addSpacing(10)
+
+        self._closes_lbl = QLabel("↓ 0 Closed")
+        self._closes_lbl.setStyleSheet("color: #e07050; font-size: 12px;")
+        self._closes_lbl.setToolTip("Clients closed this session")
+        g_session_lay.addWidget(self._closes_lbl)
+
+        g_session_lay.addSpacing(10)
+        g_session_lay.addWidget(_vsep())
+        g_session_lay.addSpacing(8)
+
+        self._count_lbl = QLabel("0 clients")
+        self._count_lbl.setStyleSheet(f"color: {DIM_COLOR}; font-size: 12px;")
+        self._count_lbl.setToolTip("Active bot clients detected")
+        g_session_lay.addWidget(self._count_lbl)
+        tb_layout.addWidget(g_session)
+
+        tb_layout.addStretch()
+
+        # ---- Group: view controls (sort / zoom / capture rate) ----
+        g_view, g_view_lay = _group()
+
+        sort_combo = self._sort_combo = QComboBox()
+        sort_combo.addItems(["Sort: Default", "CPU ↑", "CPU ↓", "RAM ↑", "RAM ↓"])
+        sort_combo.setFixedHeight(28)
+        sort_combo.setFixedWidth(120)
+        sort_combo.setCursor(QCursor(Qt.PointingHandCursor))
+        sort_combo.setStyleSheet(COMBO_STYLE)
+        sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        g_view_lay.addWidget(sort_combo)
+        g_view_lay.addSpacing(8)
+
+        # ---- Zoom controls (also available via Ctrl+wheel / Ctrl+= / Ctrl+- / Ctrl+0) ----
         zoom_out_btn = _small_btn("−", "Smaller cards (Ctrl+-)")
         zoom_out_btn.clicked.connect(lambda: self._grid_view.zoom(1.0 / ZOOM_FACTOR))
         zoom_reset_btn = _small_btn("⤢", "Reset card size (Ctrl+0)")
@@ -1393,10 +1456,10 @@ class BotWall(QMainWindow):
         )
         zoom_in_btn = _small_btn("+", "Larger cards (Ctrl+=)")
         zoom_in_btn.clicked.connect(lambda: self._grid_view.zoom(ZOOM_FACTOR))
-        tb_layout.addWidget(zoom_out_btn)
-        tb_layout.addWidget(zoom_reset_btn)
-        tb_layout.addWidget(zoom_in_btn)
-        tb_layout.addSpacing(8)
+        g_view_lay.addWidget(zoom_out_btn)
+        g_view_lay.addWidget(zoom_reset_btn)
+        g_view_lay.addWidget(zoom_in_btn)
+        g_view_lay.addSpacing(8)
 
         # ---- CPU mode toggle ----
         def _cpu_btn_style(active: bool) -> str:
@@ -1431,9 +1494,13 @@ class BotWall(QMainWindow):
         # store the style factory for reuse when toggling
         self._cpu_btn_style = _cpu_btn_style
 
-        tb_layout.addWidget(self._btn_high_cpu)
-        tb_layout.addWidget(self._btn_low_cpu)
-        tb_layout.addSpacing(8)
+        g_view_lay.addWidget(self._btn_high_cpu)
+        g_view_lay.addWidget(self._btn_low_cpu)
+        tb_layout.addWidget(g_view)
+
+        # ---- Group: secondary actions ----
+        g_extra, g_extra_lay = _group()
+        g_extra_lay.addSpacing(2)
 
         discord_btn = QPushButton("Discord")
         discord_btn.setFixedHeight(28)
@@ -1452,71 +1519,36 @@ class BotWall(QMainWindow):
             QPushButton:hover { background: #6b77f5; }
             QPushButton:pressed { background: #4752c4; }
         """)
-        discord_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl("https://discord.gg/fEg3X3a5sh"))
+        discord_btn.clicked.connect(self._open_discord)
+        g_extra_lay.addWidget(discord_btn)
+        g_extra_lay.addSpacing(8)
+
+        maximize_all_btn = _flat_btn(
+            "Maximize All", "Maximize all client windows in the current tab"
         )
-        tb_layout.addWidget(discord_btn)
-        tb_layout.addSpacing(8)
-
-        maximize_all_btn = QPushButton("Maximize All")
-        maximize_all_btn.setFixedHeight(28)
-        maximize_all_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        maximize_all_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {DIM_COLOR};
-                border: 1px solid {DIM_COLOR};
-                border-radius: 3px;
-                font-size: 11px;
-                font-weight: bold;
-                padding: 0 8px;
-            }}
-            QPushButton:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
-            QPushButton:pressed {{ background: #1a3a40; }}
-        """)
-        maximize_all_btn.setToolTip("Maximize all client windows in the current tab")
         maximize_all_btn.clicked.connect(self._maximize_all)
-        tb_layout.addWidget(maximize_all_btn)
+        g_extra_lay.addWidget(maximize_all_btn)
 
-        restore_all_btn = QPushButton("Restore All")
-        restore_all_btn.setFixedHeight(28)
-        restore_all_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        restore_all_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {DIM_COLOR};
-                border: 1px solid {DIM_COLOR};
-                border-radius: 3px;
-                font-size: 11px;
-                font-weight: bold;
-                padding: 0 8px;
-            }}
-            QPushButton:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
-            QPushButton:pressed {{ background: #1a3a40; }}
-        """)
-        restore_all_btn.setToolTip("Restore all client windows in the current tab")
+        restore_all_btn = _flat_btn(
+            "Restore All", "Restore all client windows in the current tab"
+        )
         restore_all_btn.clicked.connect(self._restore_all)
-        tb_layout.addWidget(restore_all_btn)
+        g_extra_lay.addWidget(restore_all_btn)
 
-        log_btn = QPushButton("Log")
-        log_btn.setFixedHeight(28)
-        log_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        log_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {DIM_COLOR};
-                border: 1px solid {DIM_COLOR};
-                border-radius: 3px;
-                font-size: 11px;
-                font-weight: bold;
-                padding: 0 8px;
-            }}
-            QPushButton:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
-            QPushButton:pressed {{ background: #1a3a40; }}
-        """)
-        log_btn.setToolTip("Session event log (opens, closes, title changes)")
+        log_btn = _flat_btn(
+            "Log", "Session event log (opens, closes, title changes)"
+        )
         log_btn.clicked.connect(self._show_log)
-        tb_layout.addWidget(log_btn)
+        g_extra_lay.addWidget(log_btn)
+        tb_layout.addWidget(g_extra)
+
+        # ---- Overflow menu (holds whatever the current width squeezed out) ----
+        self._overflow_btn = _small_btn("⋯", "Controls hidden by the window width")
+        self._overflow_menu = QMenu(self)
+        self._overflow_menu.setStyleSheet(MENU_STYLE)
+        self._overflow_menu.aboutToShow.connect(self._build_overflow_menu)
+        self._overflow_btn.setMenu(self._overflow_menu)
+        tb_layout.addWidget(self._overflow_btn)
 
         settings_btn = _small_btn("⚙", "Settings: scan keywords, alert words")
         settings_btn.clicked.connect(self._show_settings)
@@ -1541,6 +1573,18 @@ class BotWall(QMainWindow):
         kill_btn.setToolTip("Kill every client process in the current tab")
         kill_btn.clicked.connect(self._kill_all)
         tb_layout.addWidget(kill_btn)
+
+        # Hide order as the window narrows — first entry goes first. BotWall's
+        # own CPU/MEM is the least useful thing here; the farm totals in
+        # `session` are the most, so they survive longest. KILL ALL, ⚙ and ⋯
+        # are never collapsible, so the toolbar always stays usable.
+        self._tb_groups = [
+            ("stats",   g_stats),
+            ("extra",   g_extra),
+            ("view",    g_view),
+            ("title",   title_lbl),
+            ("session", g_session),
+        ]
 
         # ---- Client-type tabs (All / DreamBot / TwiLite / …) ----
         tabs_widget = QWidget()
@@ -1575,29 +1619,32 @@ class BotWall(QMainWindow):
         self._script_combo.setMinimumWidth(150)
         self._script_combo.setCursor(QCursor(Qt.PointingHandCursor))
         self._script_combo.setToolTip("Filter DreamBot clients by the script in their title")
-        self._script_combo.setStyleSheet(f"""
-            QComboBox {{
-                background: transparent;
-                color: {DIM_COLOR};
-                border: 1px solid {DIM_COLOR};
-                border-radius: 3px;
-                font-size: 11px;
-                padding: 0 4px;
-            }}
-            QComboBox:hover {{ border-color: {ACCENT_TEAL}; color: {TEXT_COLOR}; }}
-            QComboBox::drop-down {{ border: none; width: 16px; }}
-            QComboBox QAbstractItemView {{
-                background: #1a1a2e;
-                color: {TEXT_COLOR};
-                border: 1px solid {DIM_COLOR};
-                selection-background-color: {HEADER_COLOR};
-            }}
-        """)
+        self._script_combo.setStyleSheet(COMBO_STYLE)
         self._script_combo.currentIndexChanged.connect(self._on_script_changed)
         tabs_layout.addWidget(self._script_combo)
         # Hidden until a scan finds DreamBot clients with parseable scripts
         self._script_lbl.setVisible(False)
         self._script_combo.setVisible(False)
+
+        # ---- Toolbar collapse toggle ----
+        self._collapse_btn = QPushButton("▴")
+        self._collapse_btn.setFixedSize(24, 24)
+        self._collapse_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self._collapse_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {DIM_COLOR};
+                border: 1px solid transparent;
+                border-radius: 3px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{ border-color: {DIM_COLOR}; color: {TEXT_COLOR}; }}
+        """)
+        self._collapse_btn.clicked.connect(
+            lambda: self._set_toolbar_collapsed(self._toolbar_widget.isVisible())
+        )
+        tabs_layout.addWidget(self._collapse_btn)
+        self._set_toolbar_collapsed(False)
 
         self._refresh_tabs()
 
@@ -1630,6 +1677,133 @@ class BotWall(QMainWindow):
         QShortcut(QKeySequence("Ctrl+0"), self).activated.connect(
             lambda: self._grid_view.set_card_size(CARD_W_DEFAULT, CARD_H_DEFAULT)
         )
+
+    # ------------------------------------------------------------------
+    # Responsive toolbar
+    # ------------------------------------------------------------------
+    def _tb_widths(self) -> dict[str, int]:
+        """Width each group needs right now, incl. the gap it would free up.
+
+        Measured live rather than cached: the stats labels start as "0 clients"
+        / "CPU: –" and grow by ~150 px once real numbers arrive, so a width
+        cached at construction time makes the toolbar overflow and clip."""
+        return {
+            name: w.minimumSizeHint().width() + TB_SPACING
+            for name, w in self._tb_groups
+        }
+
+    def _measure_toolbar(self):
+        """Measure the chrome that is never hidden (title through KILL ALL).
+
+        Must run with every group visible, otherwise the remainder comes out
+        too small. Unlike the groups this stays fixed, so it's measured once."""
+        for _name, w in self._tb_groups:
+            w.setVisible(True)
+        self._overflow_btn.setVisible(True)
+        self._toolbar_widget.layout().activate()
+        full = self._toolbar_widget.minimumSizeHint().width()
+        self._tb_fixed_w = full - sum(self._tb_widths().values())
+        self._tb_measured = True
+
+    def _reflow_toolbar(self):
+        """Show as many groups as fit; the rest move to the ⋯ menu."""
+        if not self._tb_measured:
+            return
+        widths = self._tb_widths()
+        avail = self.width() - TB_REFLOW_SLACK
+        used = self._tb_fixed_w
+        shown = set()
+        # Walk highest-priority first — _tb_groups is in hide order. Stop at the
+        # first group that doesn't fit rather than squeezing in a smaller one
+        # behind it, so groups always vanish in the same order and the toolbar
+        # doesn't reshuffle as the window is dragged.
+        for name, _w in reversed(self._tb_groups):
+            cost = widths[name]
+            if used + cost > avail:
+                break
+            used += cost
+            shown.add(name)
+        for name, w in self._tb_groups:
+            w.setVisible(name in shown)
+        self._overflow_btn.setVisible(len(shown) < len(self._tb_groups))
+
+    def _build_overflow_menu(self):
+        """Populate ⋯ with exactly the controls the current width squeezed out."""
+        m = self._overflow_menu
+        m.clear()
+        hidden = {name for name, w in self._tb_groups if not w.isVisible()}
+
+        if "stats" in hidden:
+            m.addAction(
+                f"{self._self_cpu_lbl.text()}    {self._self_mem_lbl.text()}"
+            ).setEnabled(False)
+        if "session" in hidden:
+            m.addAction(
+                f"{self._opens_lbl.text()}    {self._closes_lbl.text()}"
+            ).setEnabled(False)
+            m.addAction(self._count_lbl.text()).setEnabled(False)
+        if hidden & {"stats", "session"} and hidden & {"view", "extra"}:
+            m.addSeparator()
+
+        if "view" in hidden:
+            sort_menu = m.addMenu("Sort")
+            for i in range(self._sort_combo.count()):
+                a = sort_menu.addAction(self._sort_combo.itemText(i))
+                a.setCheckable(True)
+                a.setChecked(i == self._sort_combo.currentIndex())
+                a.triggered.connect(
+                    lambda _checked, ix=i: self._sort_combo.setCurrentIndex(ix)
+                )
+
+            zoom_menu = m.addMenu("Zoom")
+            zoom_menu.addAction(
+                "Larger cards\tCtrl+=", lambda: self._grid_view.zoom(ZOOM_FACTOR)
+            )
+            zoom_menu.addAction(
+                "Smaller cards\tCtrl+-", lambda: self._grid_view.zoom(1.0 / ZOOM_FACTOR)
+            )
+            zoom_menu.addAction(
+                "Reset card size\tCtrl+0",
+                lambda: self._grid_view.set_card_size(CARD_W_DEFAULT, CARD_H_DEFAULT),
+            )
+
+            cpu_menu = m.addMenu("Capture rate")
+            for label, mode in (("High CPU", "high"), ("Low CPU", "low")):
+                a = cpu_menu.addAction(label)
+                a.setCheckable(True)
+                a.setChecked((mode == "low") == self._low_cpu_active)
+                a.triggered.connect(
+                    lambda _checked, md=mode: self._set_cpu_mode(md)
+                )
+
+        if "extra" in hidden:
+            if "view" in hidden:
+                m.addSeparator()
+            m.addAction("Maximize All", self._maximize_all)
+            m.addAction("Restore All", self._restore_all)
+            m.addAction("Log", self._show_log)
+            m.addAction("Discord", self._open_discord)
+
+    def _open_discord(self):
+        QDesktopServices.openUrl(QUrl(DISCORD_URL))
+
+    def _set_toolbar_collapsed(self, collapsed: bool):
+        """Hide the toolbar row entirely, leaving just the tabs."""
+        self._toolbar_widget.setVisible(not collapsed)
+        self._collapse_btn.setText("▾" if collapsed else "▴")
+        self._collapse_btn.setToolTip(
+            "Show the toolbar" if collapsed else "Hide the toolbar"
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._tb_measured:
+            self._measure_toolbar()
+            self._reflow_toolbar()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow_toolbar()
 
     # ------------------------------------------------------------------
     # Client-type tabs
@@ -1941,6 +2115,8 @@ class BotWall(QMainWindow):
         self._count_lbl.setToolTip(
             "Detected clients · combined CPU (% of machine) and RAM of their processes"
         )
+        # The stats labels just changed width — re-check what still fits
+        self._reflow_toolbar()
 
         # Track client opens, closes, and title changes
         new_hwnd_titles = {c[0]: c[1] for c in clients}
@@ -2049,6 +2225,8 @@ class BotWall(QMainWindow):
         kind = s.value("active_kind", "") or ""
         if kind in (*CLIENT_KINDS, OTHER_KIND):
             self._set_active_kind(kind)
+        if s.value("toolbar_collapsed", "false") == "true":
+            self._set_toolbar_collapsed(True)
 
     def _save_nicknames(self):
         self._settings.setValue(
@@ -2074,6 +2252,8 @@ class BotWall(QMainWindow):
         s.setValue("scan_keywords", self._scan_keywords)
         s.setValue("alert_words", self._alert_words)
         s.setValue("active_kind", self._active_kind or "")
+        s.setValue("toolbar_collapsed",
+                   "true" if not self._toolbar_widget.isVisible() else "false")
 
     # ------------------------------------------------------------------
     # Maximize / Restore all
