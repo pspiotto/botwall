@@ -35,11 +35,14 @@ The entire application is a single file: `botwall.py` (~2000 lines).
 - Alert words (settings dialog): if a client's title *changes* and contains one of the words, BotWall beeps + flashes the taskbar + toasts.
 - Cards show process uptime next to the PID ("PID 1234 · 6h12m") — low uptime means a recent restart.
 - Toolbar shows aggregate farm load (ΣCPU/ΣRAM across unique client processes); zoom via toolbar −/⤢/+ buttons, Ctrl+wheel, or Ctrl+= / Ctrl+- / Ctrl+0.
+- Responsive toolbar: the toolbar is a row of collapsible *groups* (`self._tb_groups`, listed in hide order: `stats` → `extra` → `view` → `title` → `session`). `_reflow_toolbar()` runs on every `resizeEvent` and after each stats refresh, showing groups highest-priority-first and stopping at the first that doesn't fit (a strict cutoff, not a greedy fill, so groups always vanish in the same order). Whatever is hidden is rebuilt into the `⋯` overflow menu on `aboutToShow` (`_build_overflow_menu()`). Group widths are measured **live** via `_tb_widths()` — the stats labels start as `"0 clients"` / `"CPU: –"` and grow ~150 px once real numbers land, so a cached width clips them; only the never-hidden chrome (`_tb_fixed_w`: title through KILL ALL) is measured once, on first `showEvent`. KILL ALL, ⚙ and ⋯ never collapse.
+- `toolbar_widget` carries `QSizePolicy.Ignored` horizontally and `setMinimumWidth(0)`. Without that, Qt clamps the window resize at the layout's own minimum and `_reflow_toolbar()` never gets asked to do anything — the toolbar used to impose a hard 1311 px floor on the window, which made a half-monitor split impossible. The floor is now the tab strip (~500 px).
+- Toolbar collapse: the `▴`/`▾` button at the right of the tab strip hides `toolbar_widget` outright (`_set_toolbar_collapsed()`), persisted as `toolbar_collapsed`.
 - Navigation tabs (All / DreamBot / TwiLite / RuneLite / Other) filter the grid by client kind (`_client_kind()`: first `KIND_KEYWORDS` match in title or process name, else "Other"). Filtering is display-only — off-tab clients keep their captures and freeze detection (`ClientCard.update_pixmap` skips scaling while hidden; `showEvent` catches up on tab switch). KILL ALL, Maximize All, and Restore All are scoped to the active tab. DreamBot/TwiLite tabs always show; RuneLite/Other only when populated.
 - Script dropdown (right of the tab bar): filters within the current tab by the script named in a DreamBot title (`_parse_script()`: 3rd `" - "` segment, version suffix stripped, so `P2P Master AI v2.156` → `P2P Master AI`). Shown only on the DreamBot/All tabs and only when scripts are present; repopulated each scan (selection preserved) and reset on tab switch. It further narrows KILL ALL / Maximize All / Restore All (`_tab_clients()` / `GridView.all_pids(kind, script)`).
 - Per-tab zoom: card size is stored per tab in `self._card_sizes` (`""` = All), applied on tab switch via `_apply_tab_zoom()` and recorded on every zoom via the `card_size_changed` → `_on_card_size_changed` signal. Persisted as `card_sizes` JSON; a pre-per-tab-zoom install migrates its old `card_w`/`card_h` into the All slot.
 - CPU/RAM sort keys are bucketed (10% / 200 MB) so cards don't reshuffle on every scan.
-- Settings persistence via `QSettings("BotWall", "BotWall")`: window geometry, card size (zoom), sort mode, CPU mode, pinned titles, nicknames (JSON, keyed by title), scan keywords, alert words, active tab (`active_kind`), per-tab card sizes (`card_sizes` JSON). On restore, a persisted keyword list equal to the pre-tabs default `["dreambot", "runescape"]` is upgraded to the current `KEYWORDS` so TwiLite gets detected; customized lists are kept.
+- Settings persistence via `QSettings("BotWall", "BotWall")`: window geometry, card size (zoom), sort mode, CPU mode, pinned titles, nicknames (JSON, keyed by title), scan keywords, alert words, active tab (`active_kind`), per-tab card sizes (`card_sizes` JSON), toolbar collapse state (`toolbar_collapsed`). On restore, a persisted keyword list equal to the pre-tabs default `["dreambot", "runescape"]` is upgraded to the current `KEYWORDS` so TwiLite gets detected; customized lists are kept.
 
 **Window capture:**
 `capture_hwnd()` uses `ctypes.windll.user32.PrintWindow(hwnd, dc, 2)` (flag 2 = `PW_RENDERFULLCONTENT`) to capture hardware-accelerated windows. The GDI bitmap's raw BGRX bytes are wrapped directly in a `QImage(..., Format_RGB32).copy()` — no PIL, no PNG round-trip. Iconic (OS-minimized) and hung windows are skipped (`IsIconic` / `IsHungAppWindow`). All GDI handles are released in a per-handle-guarded `finally`; the bitmap must be deselected from the DC before `DeleteObject`, and pywin32's bitmap wrapper does NOT free the handle in its destructor — the manual delete is required.
@@ -47,10 +50,15 @@ The entire application is a single file: `botwall.py` (~2000 lines).
 **UI hierarchy:**
 ```
 BotWall (QMainWindow)
-├── toolbar_widget (QWidget, fixed 42px)
-│   ├── sort QComboBox  → GridView.set_sort_mode()
-│   └── High/Low CPU buttons → Capturer.set_interval() + GridView.set_low_cpu()
-├── tabs_widget (client-kind tabs → GridView.set_filter_kind(); script QComboBox → GridView.set_filter_script())
+├── toolbar_widget (QWidget, fixed 54px high, width-collapsible)
+│   ├── g_stats   — BotWall's own CPU/MEM          (hidden first)
+│   ├── g_extra   — Discord / Maximize / Restore / Log
+│   ├── g_view    — sort QComboBox → GridView.set_sort_mode(); zoom −/⤢/+;
+│   │               High/Low CPU → Capturer.set_interval() + GridView.set_low_cpu()
+│   ├── title_lbl — "BotWall" wordmark
+│   ├── g_session — ΣCPU/ΣRAM + opens/closes       (hidden last)
+│   └── ⋯ overflow · ⚙ settings · KILL ALL         (never hidden)
+├── tabs_widget (client-kind tabs → GridView.set_filter_kind(); script QComboBox → GridView.set_filter_script(); ▴/▾ toolbar collapse)
 ├── GridView (QScrollArea)
 │   ├── ClientCard × N  (one per detected window)
 │   └── EmptyPlaceholder (shown when no visible cards)
