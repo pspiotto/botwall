@@ -24,7 +24,8 @@ from PyQt5.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QUrl, QEvent, QSettings
 )
 from PyQt5.QtGui import (
-    QPixmap, QImage, QColor, QCursor, QIcon, QDesktopServices, QKeySequence
+    QPixmap, QImage, QColor, QCursor, QIcon, QDesktopServices, QKeySequence,
+    QPainter
 )
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
@@ -105,14 +106,32 @@ BOT_PROC_KEYWORDS = ("dreambot", "runelite", "osclient", "jagex", "twilite")
 # first kind whose keyword appears in its title or process name; anything
 # that passes the scan filters but matches no kind lands in "Other".
 # DreamBot and TwiLite always get a tab; the rest only when populated.
-CLIENT_KINDS = ("DreamBot", "TwiLite", "RuneLite")
+CLIENT_KINDS = ("DreamBot", "TwiLite", "Titan", "RuneLite")
 KIND_KEYWORDS = {
     "DreamBot": ("dreambot",),
     "TwiLite":  ("twilite",),
+    "Titan":    ("titan",),
     "RuneLite": ("runelite",),
 }
 OTHER_KIND = "Other"
-ALWAYS_SHOWN_KINDS = ("DreamBot", "TwiLite")
+TITAN_KIND = "Titan"
+ALWAYS_SHOWN_KINDS = ("DreamBot", "TwiLite", "Titan")
+
+# TitanClient hosts every game client as a *tab* inside one controller
+# window. Each tab is still a separate osclient.exe process, and its real
+# game window (class "JagWindow") is re-parented as a hidden child of the
+# controller — so it never shows up in EnumWindows and the title keyword
+# scan can't find it. Scanner._scan_titan walks the controller's children
+# instead. Only the ACTIVE tab actually renders: PrintWindow on an inactive
+# tab's JagWindow just returns whatever is on screen at that rectangle, so
+# those cards are marked "TAB HIDDEN" and dropped from the capture list.
+TITAN_CONTROLLER_CLASS = "TitanClientController"
+TITAN_TAB_CLASS = "JagWindow"
+TITAN_TITLE = "TitanClient"
+# Controller title while a game tab is active:
+#   "TitanClient v0.0.99 [DEV MODE] - Pown 2194 #120612"
+# (the space in the name is U+00A0; a dead tab adds " (unresponsive)").
+_TITAN_ACTIVE_RE = re.compile(r"\s-\s(.+?)\s#(\d+)(?:\s*\(.*\))?\s*$")
 
 NUM_CORES = psutil.cpu_count() or 1
 
@@ -137,6 +156,44 @@ def _client_kind(title: str, proc_name: str) -> str:
         if any(kw in haystack for kw in KIND_KEYWORDS[kind]):
             return kind
     return OTHER_KIND
+
+
+def _titan_tab_title(name: str, pid: int) -> str:
+    """Card title for a TitanClient tab. The account name is only known
+    once the tab has been active (it's read off the controller's title),
+    so fall back to the PID — the same "#<pid>" Titan shows on its tabs."""
+    return f"{TITAN_TITLE} · {name}" if name else f"{TITAN_TITLE} · tab #{pid}"
+
+
+def _fix_titan_title(title: str) -> str:
+    """The controller sets its title as UTF-8 bytes through the ANSI API, so
+    the U+00A0 in "Pown 2194" reads back as the mojibake "Â\xa0". Undo that
+    (when it round-trips) and flatten NBSP to a plain space."""
+    try:
+        title = title.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return title.replace("\xa0", " ")
+
+
+def _titan_active_tab(ctrl_hwnd: int) -> tuple[str, int]:
+    """(name, osclient pid) of the controller's active tab, or ("", 0) on
+    the Home/Settings tab. Read live off the window title — cheap enough to
+    call per capture, which is what makes tab switches race-free."""
+    try:
+        m = _TITAN_ACTIVE_RE.search(_fix_titan_title(win32gui.GetWindowText(ctrl_hwnd)))
+    except Exception:
+        return "", 0
+    return (m.group(1).strip(), int(m.group(2))) if m else ("", 0)
+
+
+def _root_hwnd(hwnd: int) -> int:
+    """Top-level ancestor (GA_ROOT) — the hwnd itself for normal clients,
+    the controller window for a TitanClient tab."""
+    try:
+        return ctypes.windll.user32.GetAncestor(hwnd, 2) or hwnd
+    except Exception:
+        return hwnd
 
 
 # DreamBot titles read "DreamBot <ver> - <email> - <Script> v<n> - <ip> [- flag]",
@@ -247,12 +304,18 @@ def capture_hwnd(hwnd: int) -> QImage | None:
 # ---------------------------------------------------------------------------
 class Scanner(QThread):
     updated = pyqtSignal(list)  # list of 7-tuples, see header above
+    # Emitted just before `updated` on every scan:
+    #   {"controller_pid": int, "active_pid": int, "hidden_hwnds": [hwnd…]}
+    # hidden_hwnds are TitanClient tabs that aren't the active tab (their
+    # frames can't be captured — see TITAN_CONTROLLER_CLASS above).
+    titan_state = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = True
         self._proc_cache: dict[int, psutil.Process] = {}  # pid → Process
         self._keywords: list[str] = list(KEYWORDS)
+        self._titan_names: dict[int, str] = {}  # osclient pid → tab name
 
     def set_keywords(self, keywords: list[str]):
         """Replace the title keywords (from the settings dialog)."""
@@ -269,30 +332,42 @@ class Scanner(QThread):
             seen_pids: set[int] = set()
             scan_t = time.time()
 
+            def stats_for(pid: int):
+                """(proc_name, cpu_pct, mem_mb, uptime_s); raises if gone."""
+                seen_pids.add(pid)
+                if pid not in pid_stats:
+                    # Reuse cached Process object so cpu_percent() is meaningful
+                    if pid not in self._proc_cache:
+                        proc = psutil.Process(pid)
+                        # First call initialises the baseline; returns 0.0
+                        proc.cpu_percent(interval=None)
+                        self._proc_cache[pid] = proc
+                    proc = self._proc_cache[pid]
+                    pid_stats[pid] = (
+                        proc.name(),
+                        proc.cpu_percent(interval=None) / NUM_CORES,
+                        proc.memory_info().rss / (1024 * 1024),
+                        max(0.0, scan_t - proc.create_time()),
+                    )
+                return pid_stats[pid]
+
+            titan_ctrls: list[int] = []
+
             def _cb(hwnd, _):
                 if not win32gui.IsWindowVisible(hwnd):
                     return
+                try:
+                    if win32gui.GetClassName(hwnd) == TITAN_CONTROLLER_CLASS:
+                        titan_ctrls.append(hwnd)
+                        return  # its tabs are handled by _scan_titan
+                except Exception:
+                    pass
                 title = win32gui.GetWindowText(hwnd)
                 if not title or not _is_interesting(title, self._keywords):
                     return
                 try:
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    seen_pids.add(pid)
-                    if pid not in pid_stats:
-                        # Reuse cached Process object so cpu_percent() is meaningful
-                        if pid not in self._proc_cache:
-                            proc = psutil.Process(pid)
-                            # First call initialises the baseline; returns 0.0
-                            proc.cpu_percent(interval=None)
-                            self._proc_cache[pid] = proc
-                        proc = self._proc_cache[pid]
-                        pid_stats[pid] = (
-                            proc.name(),
-                            proc.cpu_percent(interval=None) / NUM_CORES,
-                            proc.memory_info().rss / (1024 * 1024),
-                            max(0.0, scan_t - proc.create_time()),
-                        )
-                    proc_name, cpu_pct, mem_mb, uptime_s = pid_stats[pid]
+                    proc_name, cpu_pct, mem_mb, uptime_s = stats_for(pid)
                 except Exception:
                     return
                 if not _is_bot_process(proc_name):
@@ -300,18 +375,71 @@ class Scanner(QThread):
                 clients.append((hwnd, title, pid, proc_name, cpu_pct, mem_mb, uptime_s))
 
             win32gui.EnumWindows(_cb, None)
+            titan = self._scan_titan(titan_ctrls, clients, stats_for)
 
             # Evict cache entries for pids that no longer own a matching window
             stale = set(self._proc_cache) - seen_pids
             for pid in stale:
                 del self._proc_cache[pid]
+            for pid in [p for p in self._titan_names if p not in seen_pids]:
+                del self._titan_names[pid]
 
+            self.titan_state.emit(titan)
             self.updated.emit(clients)
             # Sleep in small increments so we can stop quickly
             for _ in range(SCAN_INTERVAL_MS // 100):
                 if not self._running:
                     break
                 time.sleep(0.1)
+
+    def _scan_titan(self, ctrls: list[int], clients: list, stats_for) -> dict:
+        """One client per TitanClient tab (see TITAN_CONTROLLER_CLASS).
+
+        The tab's hwnd is its JagWindow child; the pid is the osclient.exe
+        process behind it. Tab names come from the controller's own title,
+        which only names the *active* tab — so names are learned as the user
+        (or Titan) cycles through tabs and remembered for the session."""
+        info = {"controller_pid": 0, "active_pid": 0, "hidden_hwnds": [],
+                "tabs": {}}  # tab hwnd → (controller hwnd, osclient pid)
+        for ctrl in ctrls:
+            try:
+                _, ctrl_pid = win32process.GetWindowThreadProcessId(ctrl)
+            except Exception:
+                continue
+            info["controller_pid"] = ctrl_pid
+            name, active_pid = _titan_active_tab(ctrl)
+            if active_pid:
+                self._titan_names[active_pid] = name
+            info["active_pid"] = active_pid
+
+            tabs: list[int] = []
+
+            def _child(hwnd, _):
+                try:
+                    if win32gui.GetClassName(hwnd) == TITAN_TAB_CLASS:
+                        tabs.append(hwnd)
+                except Exception:
+                    pass
+                return True
+
+            try:
+                win32gui.EnumChildWindows(ctrl, _child, None)
+            except Exception:
+                pass
+            for hwnd in tabs:
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    if pid == ctrl_pid:
+                        continue
+                    proc_name, cpu_pct, mem_mb, uptime_s = stats_for(pid)
+                except Exception:
+                    continue
+                title = _titan_tab_title(self._titan_names.get(pid, ""), pid)
+                clients.append((hwnd, title, pid, proc_name, cpu_pct, mem_mb, uptime_s))
+                info["tabs"][hwnd] = (ctrl, pid)
+                if pid != active_pid:
+                    info["hidden_hwnds"].append(hwnd)
+        return info
 
     def stop(self):
         self._running = False
@@ -339,9 +467,19 @@ class Capturer(QThread):
         self._target_w = CARD_W_DEFAULT * 2
         self._target_h = CARD_H_DEFAULT * 2
         self._frame_state: dict[int, tuple[int, float]] = {}  # hwnd → (crc, last_change_t)
+        self._titan_tabs: dict[int, tuple[int, int]] = {}  # hwnd → (ctrl hwnd, pid)
 
     def set_hwnds(self, hwnds: list[int]):
         self._hwnds = list(hwnds)
+
+    def set_titan_tabs(self, tabs: dict[int, tuple[int, int]]):
+        """TitanClient tab hwnds → (controller hwnd, osclient pid). A tab's
+        JagWindow only shows the game while it is the controller's active
+        tab; at any other moment PrintWindow returns whatever is on screen
+        (the Home page, another tab…). The Scanner only re-checks every 3 s,
+        so the capture loop verifies the active tab itself, right around
+        each PrintWindow, and drops the frame if the tab isn't (still) it."""
+        self._titan_tabs = dict(tabs)
 
     def set_interval(self, ms: int):
         self._interval_ms = ms
@@ -368,7 +506,12 @@ class Capturer(QThread):
                 for hwnd in list(self._hwnds):
                     if not self._running:
                         break
+                    tab = self._titan_tabs.get(hwnd)
+                    if tab is not None and _titan_active_tab(tab[0])[1] != tab[1]:
+                        continue  # not the active Titan tab: nothing to see
                     img = capture_hwnd(hwnd)
+                    if tab is not None and _titan_active_tab(tab[0])[1] != tab[1]:
+                        continue  # tab switched mid-capture: frame is junk
                     if img is not None:
                         if (img.width() > self._target_w
                                 or img.height() > self._target_h):
@@ -440,6 +583,10 @@ class ClientCard(QFrame):
 
         self._low_cpu = False
         self._pinned = False
+        # TitanClient tab that isn't the controller's active tab: no frames
+        # can be captured, so the last one is kept (dimmed) and freeze /
+        # no-feed detection is suspended until the tab is active again.
+        self._hidden_tab = False
 
         self.setFrameShape(QFrame.NoFrame)
         self.setCursor(QCursor(Qt.PointingHandCursor))
@@ -609,10 +756,15 @@ class ClientCard(QFrame):
         menu.addAction("Set Nickname…", self._edit_nickname)
         menu.addAction("Copy PID", self._copy_pid)
         menu.addSeparator()
-        menu.addAction(
+        restart = menu.addAction(
             "Restart Client…",
             lambda: self.restart_requested.emit(self.pid, self.title, self.proc_name)
         )
+        if self.kind == TITAN_KIND:
+            # osclient.exe is spawned and injected by the Titan controller;
+            # relaunching it by command line just yields an orphan process.
+            restart.setEnabled(False)
+            restart.setText("Restart Client (use TitanClient's Launch New Client)")
         menu.addAction(
             "Kill This Client…",
             lambda: self.kill_requested.emit(self.pid, self.title, self.proc_name)
@@ -633,15 +785,31 @@ class ClientCard(QFrame):
             self.nickname_changed.emit(self.hwnd, self.nickname)
 
     def _bring_to_front(self):
+        # A Titan tab is a child window; raise its controller instead.
+        hwnd = _root_hwnd(self.hwnd)
         try:
-            placement = win32gui.GetWindowPlacement(self.hwnd)
+            placement = win32gui.GetWindowPlacement(hwnd)
             if placement[1] == win32con.SW_SHOWMINIMIZED:
-                win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(self.hwnd)
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
         except Exception:
             pass
 
+    def set_hidden_tab(self, hidden: bool):
+        if hidden == self._hidden_tab:
+            return
+        self._hidden_tab = hidden
+        if hidden:
+            self._apply_status("TAB HIDDEN", DIM_COLOR)
+        else:
+            # Frames resume now; don't let check_feed flag the gap as NO FEED
+            self._last_frame_ts = time.monotonic()
+            self._apply_status(None, None)
+        self._rescale()
+
     def update_pixmap(self, pixmap: QPixmap, age_s: float = 0.0):
+        if self._hidden_tab:
+            return  # in-flight capture of a tab that just went hidden: junk
         self._pixmap_raw = pixmap
         self._last_frame_ts = time.monotonic()
         self._set_freshness(age_s)
@@ -665,6 +833,8 @@ class ClientCard(QFrame):
     def check_feed(self):
         """Called once per scan: flag cards whose captures stopped arriving
         (window OS-minimized, or PrintWindow failing)."""
+        if self._hidden_tab:
+            return  # expected: nothing is captured for an inactive Titan tab
         if time.monotonic() - self._last_frame_ts > NO_FEED_S:
             self._apply_status("NO FEED", DIM_COLOR)
 
@@ -682,6 +852,9 @@ class ClientCard(QFrame):
             )
             self._status_lbl.show()
             self._status_lbl.setToolTip(
+                "Not the active TitanClient tab — only the active tab renders, "
+                "so this shows the last frame seen. Process stats stay live."
+                if text == "TAB HIDDEN" else
                 "Frame content has not changed — client may be stuck or logged out"
                 if color != DIM_COLOR else
                 "No captures arriving (window minimized or capture failing)"
@@ -713,6 +886,12 @@ class ClientCard(QFrame):
             # converting first costs more than the smooth scaling it replaces
             gray = scaled.toImage().convertToFormat(QImage.Format_Grayscale8)
             scaled = QPixmap.fromImage(gray)
+        if self._hidden_tab:
+            # Dim the stale frame so it can't pass for a live one at a glance
+            scaled = QPixmap(scaled)
+            painter = QPainter(scaled)
+            painter.fillRect(scaled.rect(), QColor(0, 0, 0, 150))
+            painter.end()
         self._img_lbl.setPixmap(scaled)
 
     def resizeEvent(self, event):
@@ -1061,6 +1240,11 @@ class GridView(QScrollArea):
             if hwnd not in self._minimized:
                 card.check_feed()
 
+    def set_hidden_tabs(self, hwnds: set[int]):
+        """Mark inactive TitanClient tabs (see ClientCard.set_hidden_tab)."""
+        for hwnd, card in self._cards.items():
+            card.set_hidden_tab(hwnd in hwnds)
+
     def zoom(self, factor: float):
         self._card_w = max(160, min(1600, int(self._card_w * factor)))
         self._card_h = max(110, min(1100, int(self._card_h * factor)))
@@ -1281,6 +1465,8 @@ class BotWall(QMainWindow):
         self.setStyleSheet(f"QMainWindow {{ background: {BG_COLOR}; }}")
 
         self._clients: list[tuple] = []
+        self._titan_hidden: set[int] = set()   # inactive Titan tab hwnds
+        self._titan_controller_pid = 0
         self._total_opens = 0
         self._total_closes = 0
         self._active_hwnds: dict[int, str] = {}  # hwnd → title for open clients
@@ -2040,6 +2226,7 @@ class BotWall(QMainWindow):
     # ------------------------------------------------------------------
     def _start_threads(self):
         self._scanner = Scanner()
+        self._scanner.titan_state.connect(self._on_titan_state)
         self._scanner.updated.connect(self._on_scan)
         self._scanner.start()
 
@@ -2077,11 +2264,19 @@ class BotWall(QMainWindow):
             pass
 
     def _push_capture_hwnds(self):
-        """Hand the Capturer only the hwnds whose cards are actually shown."""
-        minimized = self._grid_view.minimized_hwnds()
+        """Hand the Capturer only the hwnds whose cards are actually shown
+        (and, for TitanClient, only the active tab — the rest can't render)."""
+        skip = self._grid_view.minimized_hwnds() | self._titan_hidden
         self._capturer.set_hwnds(
-            [c[0] for c in self._clients if c[0] not in minimized]
+            [c[0] for c in self._clients if c[0] not in skip]
         )
+
+    def _on_titan_state(self, info: dict):
+        # Arrives right before the matching `updated` signal (same thread,
+        # same queue), so _on_scan sees the current hidden set.
+        self._titan_hidden = set(info.get("hidden_hwnds", ()))
+        self._titan_controller_pid = info.get("controller_pid", 0)
+        self._capturer.set_titan_tabs(info.get("tabs", {}))
 
     def _on_scan(self, clients: list):
         self._clients = clients
@@ -2093,6 +2288,7 @@ class BotWall(QMainWindow):
         self._refresh_tabs()
         self._refresh_script_filter()
         self._grid_view.update_clients(clients)
+        self._grid_view.set_hidden_tabs(self._titan_hidden)
         self._grid_view.check_feeds()
         self._push_capture_hwnds()
         # Push live stats into minimized shelf strips
@@ -2258,15 +2454,19 @@ class BotWall(QMainWindow):
     # ------------------------------------------------------------------
     # Maximize / Restore all
     # ------------------------------------------------------------------
+    def _tab_root_hwnds(self) -> list[int]:
+        # Titan tabs are child windows — act on their controller (once).
+        return list(dict.fromkeys(_root_hwnd(c[0]) for c in self._tab_clients()))
+
     def _maximize_all(self):
-        for hwnd, *_ in self._tab_clients():
+        for hwnd in self._tab_root_hwnds():
             try:
                 win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
             except Exception:
                 pass
 
     def _restore_all(self):
-        for hwnd, *_ in self._tab_clients():
+        for hwnd in self._tab_root_hwnds():
             try:
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             except Exception:
@@ -2363,10 +2563,21 @@ class BotWall(QMainWindow):
             return
         names = sorted({c[3] for c in self._clients if c[2] in pids and c[3]})
         name_line = f"Processes: {', '.join(names)}\n" if names else ""
+        # Killing every Titan tab leaves a controller full of dead tabs (its
+        # "Launch New Client" then lands on an "(unresponsive)" tab), so take
+        # the controller down with them — but only when ALL its tabs are in
+        # scope; a script/tab-scoped kill must not touch the other tabs.
+        titan_pids = {c[2] for c in self._clients
+                      if _client_kind(c[1], c[3]) == TITAN_KIND}
+        ctrl_line = ""
+        if (self._titan_controller_pid and titan_pids
+                and titan_pids <= set(pids)):
+            pids.append(self._titan_controller_pid)  # last: tabs die first
+            ctrl_line = "Plus the TitanClient controller window.\n"
         reply = QMessageBox.question(
             self, "Kill All",
             f"Kill {len(pids)} {scope} process{'es' if len(pids) != 1 else ''}?\n"
-            f"{name_line}"
+            f"{name_line}{ctrl_line}"
             "This will forcefully terminate them.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
