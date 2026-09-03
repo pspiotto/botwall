@@ -1,10 +1,10 @@
 # BotWall
 
-A live screenshot monitor for DreamBot, TwiLite, TitanClient, and RuneScape clients on Windows. View all your running clients in a single dashboard with real-time screen capture, CPU/memory stats, and quick window management.
+A live screenshot monitor for DreamBot, TwiLite, TitanClient, OnlyBot, and RuneLite/RuneScape clients on Windows. View all your running clients in a single dashboard with real-time screen capture, CPU/memory stats, and quick window management.
 
 ## Features
 
-- **Live screen capture** of all detected DreamBot / TwiLite / RuneScape windows
+- **Live screen capture** of all detected DreamBot / TwiLite / Titan / OnlyBot / RuneLite windows
 - **TitanClient tabs** — each tab of a TitanClient controller gets its own card (CPU/RAM/uptime, kill, nickname). Only Titan's *active* tab renders, so other tabs show their last frame dimmed with a "TAB HIDDEN" badge; tab names are picked up as tabs become active
 - **Navigation tabs** — filter the wall by client type (All / DreamBot / TwiLite / …); KILL ALL and Maximize/Restore All apply to the active tab only
 - **Script filter** — narrow DreamBot clients by the script in their title (e.g. P2P Master AI vs MaxTutorialIsland)
@@ -42,7 +42,7 @@ pip install -r requirements.txt
 python botwall.py
 ```
 
-BotWall will automatically detect visible windows with "dreambot", "twilite", or "runescape" in the title (configurable in ⚙ settings) and begin capturing screenshots. Each client is classified as DreamBot, TwiLite, Titan, RuneLite, or Other, and the tab bar under the toolbar filters the wall by type.
+BotWall will automatically detect visible windows with "dreambot", "twilite", "runescape", or "runelite" in the title (configurable in ⚙ settings) and begin capturing screenshots. Each client is classified as DreamBot, TwiLite, Titan, OnlyBot (a RuneLite client launched from OnlyBot's `.onlybot` install), RuneLite, or Other, and the tab bar under the toolbar filters the wall by type.
 
 ### Controls
 
