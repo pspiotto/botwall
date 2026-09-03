@@ -94,28 +94,51 @@ MENU_STYLE = f"""
     QMenu::separator {{ height: 1px; background: {DIM_COLOR}; margin: 4px 8px; }}
 """
 
-KEYWORDS = ("dreambot", "runescape", "twilite")
+KEYWORDS = ("dreambot", "runescape", "twilite", "runelite")
+# Defaults from earlier releases. A persisted keyword list equal to one of
+# these was never customized, so it's upgraded to KEYWORDS on restore.
+OLD_DEFAULT_KEYWORDS = (
+    ("dreambot", "runescape"),
+    ("dreambot", "runescape", "twilite"),
+)
 
 # A window only counts as a client if its process also looks like one.
 # Without this, a browser tab titled "RuneScape Wiki" gets a card — and
 # gets its process terminated by KILL ALL.
 BOT_PROC_NAMES    = ("java.exe", "javaw.exe")
-BOT_PROC_KEYWORDS = ("dreambot", "runelite", "osclient", "jagex", "twilite")
+BOT_PROC_KEYWORDS = ("dreambot", "runelite", "osclient", "jagex", "twilite",
+                     "onlybot")
+
+# Some farm managers launch a stock-looking client whose window and process
+# give nothing away: OnlyBot runs a RuneLite fork as a plain java.exe titled
+# "RuneLite - <character>". The only fingerprint is the JVM's exe path
+# (…\.onlybot\lib\jdks\…\java.exe), so the scanner tags the process name
+# with the launcher — "java.exe (OnlyBot)" — and _client_kind() reads the
+# tag like any other keyword. Matched case-insensitively against the exe path.
+# DreamBot's bundled JRE is tagged too, so a DreamBot JVM whose title has lost
+# the word (e.g. a "Fatal error starting RuneLite" dialog) stays on the
+# DreamBot tab instead of drifting to RuneLite.
+LAUNCHER_PATH_MARKERS = {
+    ".onlybot": "OnlyBot",
+    "\\dreambot\\": "DreamBot",
+}
 
 # Client kinds drive the navigation tabs. A window is classified by the
 # first kind whose keyword appears in its title or process name; anything
 # that passes the scan filters but matches no kind lands in "Other".
-# DreamBot and TwiLite always get a tab; the rest only when populated.
-CLIENT_KINDS = ("DreamBot", "TwiLite", "Titan", "RuneLite")
+# DreamBot, TwiLite, Titan and OnlyBot always get a tab; the rest only when
+# populated. OnlyBot must precede RuneLite: its titles say "RuneLite".
+CLIENT_KINDS = ("DreamBot", "TwiLite", "Titan", "OnlyBot", "RuneLite")
 KIND_KEYWORDS = {
     "DreamBot": ("dreambot",),
     "TwiLite":  ("twilite",),
     "Titan":    ("titan",),
+    "OnlyBot":  ("onlybot",),
     "RuneLite": ("runelite",),
 }
 OTHER_KIND = "Other"
 TITAN_KIND = "Titan"
-ALWAYS_SHOWN_KINDS = ("DreamBot", "TwiLite", "Titan")
+ALWAYS_SHOWN_KINDS = ("DreamBot", "TwiLite", "Titan", "OnlyBot")
 
 # TitanClient hosts every game client as a *tab* inside one controller
 # window. Each tab is still a separate osclient.exe process, and its real
@@ -149,8 +172,23 @@ def _is_bot_process(proc_name: str) -> bool:
     return nl in BOT_PROC_NAMES or any(kw in nl for kw in BOT_PROC_KEYWORDS)
 
 
+def _proc_label(proc: "psutil.Process") -> str:
+    """Process name for the scanner tuple, with the launcher appended when
+    the exe path reveals one (see LAUNCHER_PATH_MARKERS)."""
+    name = proc.name()
+    try:
+        exe = proc.exe().lower()
+    except Exception:  # AccessDenied, ZombieProcess…
+        return name
+    for marker, launcher in LAUNCHER_PATH_MARKERS.items():
+        if marker in exe:
+            return f"{name} ({launcher})"
+    return name
+
+
 def _client_kind(title: str, proc_name: str) -> str:
-    """Classify a client window for the navigation tabs."""
+    """Classify a client window for the navigation tabs. `proc_name` may
+    carry a launcher suffix ("java.exe (OnlyBot)") — see _proc_label."""
     haystack = f"{title} {proc_name}".lower()
     for kind in CLIENT_KINDS:
         if any(kw in haystack for kw in KIND_KEYWORDS[kind]):
@@ -344,7 +382,7 @@ class Scanner(QThread):
                         self._proc_cache[pid] = proc
                     proc = self._proc_cache[pid]
                     pid_stats[pid] = (
-                        proc.name(),
+                        _proc_label(proc),
                         proc.cpu_percent(interval=None) / NUM_CORES,
                         proc.memory_info().rss / (1024 * 1024),
                         max(0.0, scan_t - proc.create_time()),
@@ -2073,7 +2111,7 @@ class BotWall(QMainWindow):
 
     def _refresh_tabs(self):
         """Update tab labels/counts, highlight the active one, and hide
-        never-populated optional kinds (DreamBot/TwiLite tabs always show)."""
+        never-populated optional kinds (see ALWAYS_SHOWN_KINDS)."""
         total = sum(self._kind_counts.values())
         for kind, btn in self._tab_buttons.items():
             active = kind == self._active_kind
@@ -2407,9 +2445,10 @@ class BotWall(QMainWindow):
 
         kw = _str_list("scan_keywords")
         if kw:
-            if sorted(kw) == ["dreambot", "runescape"]:
-                # Pre-tabs default was persisted verbatim — upgrade it so
-                # TwiLite clients are detected. Customized lists are kept.
+            if any(sorted(kw) == sorted(old) for old in OLD_DEFAULT_KEYWORDS):
+                # An earlier default was persisted verbatim — upgrade it so
+                # newer client kinds (TwiLite, OnlyBot's RuneLite) are
+                # detected. Customized lists are kept.
                 kw = list(KEYWORDS)
             self._scan_keywords = kw
             self._scanner.set_keywords(kw)
