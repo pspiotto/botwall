@@ -65,7 +65,7 @@ ACCENT_RED      = "#df4545"
 TB_SPACING        = 6    # toolbar inter-item gap
 TB_REFLOW_SLACK   = 8    # px of headroom before a toolbar group is dropped
 
-DISCORD_URL = "https://discord.gg/fEg3X3a5sh"
+DISCORD_URL = "https://discord.gg/KeKSYRCJms"
 
 COMBO_STYLE = f"""
     QComboBox {{
@@ -1729,7 +1729,7 @@ class BotWall(QMainWindow):
         discord_btn = QPushButton("Discord")
         discord_btn.setFixedHeight(28)
         discord_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        discord_btn.setToolTip("Join the ETS Discord")
+        discord_btn.setToolTip("Join the StealthAccounts Discord")
         discord_btn.setStyleSheet("""
             QPushButton {
                 background: #5865f2;
