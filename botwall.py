@@ -33,7 +33,8 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QMessageBox, QComboBox, QMenu,
     QSystemTrayIcon, QDialog, QPlainTextEdit,
     QShortcut, QInputDialog, QLineEdit, QFormLayout, QDialogButtonBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QDoubleSpinBox
 )
 
 # ---------------------------------------------------------------------------
@@ -42,6 +43,8 @@ from PyQt5.QtWidgets import (
 SCAN_INTERVAL_MS = 3000          # re-scan window list every 3 s
 CAPTURE_INTERVAL_HIGH = 250      # High CPU: refresh every 0.25 s
 CAPTURE_INTERVAL_LOW  = 1000     # Low CPU:  refresh every 1 s
+CAPTURE_FPS_MIN = 0.1            # bounds for the user-set FPS (settings dialog)
+CAPTURE_FPS_MAX = 30.0
 
 CARD_W_DEFAULT = 320
 CARD_H_DEFAULT = 220
@@ -1565,6 +1568,8 @@ class BotWall(QMainWindow):
         self._alert_words: list[str] = []
         self._scan_keywords: list[str] = list(KEYWORDS)
         self._low_cpu_active = False
+        # Capture cycle period per CPU mode, user-editable as FPS in settings
+        self._capture_ms = {"high": CAPTURE_INTERVAL_HIGH, "low": CAPTURE_INTERVAL_LOW}
         self._active_kind: str | None = None       # None = "All" tab
         self._kind_counts: dict[str, int] = {}      # kind → client count
         self._card_sizes: dict[str, tuple[int, int]] = {}  # tab ("" = All) → (w, h)
@@ -2299,6 +2304,26 @@ class BotWall(QMainWindow):
         hint.setStyleSheet(f"color: {DIM_COLOR}; font-size: 11px;")
         form.addRow(hint)
 
+        # ---- Capture rate per CPU mode (stored as a cycle period in ms) ----
+        fps_spins: dict[str, QDoubleSpinBox] = {}
+        for mode, label in (("high", "High CPU FPS:"), ("low", "Low CPU FPS:")):
+            spin = QDoubleSpinBox()
+            spin.setRange(CAPTURE_FPS_MIN, CAPTURE_FPS_MAX)
+            spin.setDecimals(1)
+            spin.setSingleStep(0.5)
+            spin.setValue(1000 / self._capture_ms[mode])
+            spin.setToolTip(
+                "Screenshots per second of every visible client in this mode. "
+                "Higher is smoother but costs more CPU."
+            )
+            spin.setStyleSheet(
+                f"QDoubleSpinBox {{ background: {CARD_COLOR}; color: {TEXT_COLOR}; "
+                f"border: 1px solid {DIM_COLOR}; border-radius: 3px; "
+                f"padding: 3px; font-size: 12px; }}"
+            )
+            fps_spins[mode] = spin
+            form.addRow(label, spin)
+
         # ---- Client kinds (one tab each) ----
         clients_lbl = QLabel("Clients (one tab each; first match wins, top to bottom):")
         form.addRow(clients_lbl)
@@ -2450,9 +2475,14 @@ class BotWall(QMainWindow):
         self._scanner.set_keywords(self._scan_keywords)
         self._settings.setValue("scan_keywords", self._scan_keywords)
         self._settings.setValue("alert_words", self._alert_words)
+        for mode, spin in fps_spins.items():
+            self._capture_ms[mode] = round(1000 / spin.value())
+            self._settings.setValue(f"capture_ms_{mode}", self._capture_ms[mode])
+        self._set_cpu_mode("low" if self._low_cpu_active else "high")
         self._log_event(
             f"Settings updated — keywords: {', '.join(self._scan_keywords)}"
             + (f"; alert words: {', '.join(self._alert_words)}" if self._alert_words else "")
+            + f"; FPS high {fps_spins['high'].value():g} / low {fps_spins['low'].value():g}"
         )
 
     # ------------------------------------------------------------------
@@ -2592,7 +2622,7 @@ class BotWall(QMainWindow):
     def _set_cpu_mode(self, mode: str):
         low = (mode == "low")
         self._low_cpu_active = low
-        self._capturer.set_interval(CAPTURE_INTERVAL_LOW if low else CAPTURE_INTERVAL_HIGH)
+        self._capturer.set_interval(self._capture_ms["low" if low else "high"])
         self._grid_view.set_low_cpu(low)
         self._btn_high_cpu.setStyleSheet(self._cpu_btn_style(not low))
         self._btn_low_cpu.setStyleSheet(self._cpu_btn_style(low))
@@ -2628,8 +2658,15 @@ class BotWall(QMainWindow):
             sort_idx = 0
         if 0 <= sort_idx < self._sort_combo.count():
             self._sort_combo.setCurrentIndex(sort_idx)
-        if s.value("cpu_mode", "high") == "low":
-            self._set_cpu_mode("low")
+        for mode in ("high", "low"):
+            try:
+                ms = int(s.value(f"capture_ms_{mode}", self._capture_ms[mode]))
+            except (TypeError, ValueError):
+                continue
+            lo, hi = round(1000 / CAPTURE_FPS_MAX), round(1000 / CAPTURE_FPS_MIN)
+            self._capture_ms[mode] = min(max(ms, lo), hi)
+        # Always applied: the persisted High FPS may differ from the default
+        self._set_cpu_mode(s.value("cpu_mode", "high"))
         pinned = s.value("pinned_titles", []) or []
         if isinstance(pinned, str):
             pinned = [pinned]
@@ -2704,6 +2741,8 @@ class BotWall(QMainWindow):
         s.setValue("card_h", card_h)
         s.setValue("sort_index", self._sort_combo.currentIndex())
         s.setValue("cpu_mode", "low" if self._low_cpu_active else "high")
+        s.setValue("capture_ms_high", self._capture_ms["high"])
+        s.setValue("capture_ms_low", self._capture_ms["low"])
         s.setValue("pinned_titles", sorted(self._grid_view.pinned_titles()))
         s.setValue("nicknames", json.dumps(self._grid_view.nicknames()))
         s.setValue("scan_keywords", self._scan_keywords)
