@@ -32,7 +32,8 @@ from PyQt5.QtWidgets import (
     QScrollArea, QGridLayout, QVBoxLayout, QHBoxLayout, QFrame,
     QSizePolicy, QMessageBox, QComboBox, QMenu,
     QSystemTrayIcon, QDialog, QPlainTextEdit,
-    QShortcut, QInputDialog, QLineEdit, QFormLayout, QDialogButtonBox
+    QShortcut, QInputDialog, QLineEdit, QFormLayout, QDialogButtonBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
 )
 
 # ---------------------------------------------------------------------------
@@ -109,36 +110,69 @@ BOT_PROC_NAMES    = ("java.exe", "javaw.exe")
 BOT_PROC_KEYWORDS = ("dreambot", "runelite", "osclient", "jagex", "twilite",
                      "onlybot")
 
-# Some farm managers launch a stock-looking client whose window and process
-# give nothing away: OnlyBot runs a RuneLite fork as a plain java.exe titled
-# "RuneLite - <character>". The only fingerprint is the JVM's exe path
-# (…\.onlybot\lib\jdks\…\java.exe), so the scanner tags the process name
-# with the launcher — "java.exe (OnlyBot)" — and _client_kind() reads the
-# tag like any other keyword. Matched case-insensitively against the exe path.
-# DreamBot's bundled JRE is tagged too, so a DreamBot JVM whose title has lost
-# the word (e.g. a "Fatal error starting RuneLite" dialog) stays on the
+# Client kinds drive the navigation tabs. The list is user-editable (⚙ →
+# Clients) and persisted as `clients` JSON; DEFAULT_CLIENTS is the seed and
+# the "Reset to defaults" target. Each kind's keywords do three jobs: a
+# window whose title contains one is scanned, a process whose name contains
+# one passes the bot-process guard, and the first kind (in list order) whose
+# keyword appears in title or process name classifies it. Anything that
+# passes the scan filters but matches no kind lands in "Other".
+#
+# path_markers: some farm managers launch a stock-looking client whose
+# window and process give nothing away. OnlyBot runs a RuneLite fork as a
+# plain java.exe titled "RuneLite - <character>"; the only fingerprint is
+# the JVM's exe path (…\.onlybot\lib\jdks\…\java.exe). A kind whose marker
+# appears in the exe path (case-insensitive) tags the process name with the
+# kind, e.g. "java.exe (OnlyBot)", and that tag wins over every keyword match.
+# DreamBot's bundled JRE is tagged too, so a DreamBot JVM whose title has
+# lost the word (e.g. a "Fatal error starting RuneLite" dialog) stays on the
 # DreamBot tab instead of drifting to RuneLite.
-LAUNCHER_PATH_MARKERS = {
-    ".onlybot": "OnlyBot",
-    "\\dreambot\\": "DreamBot",
-}
-
-# Client kinds drive the navigation tabs. A window is classified by the
-# first kind whose keyword appears in its title or process name; anything
-# that passes the scan filters but matches no kind lands in "Other".
-# DreamBot, TwiLite, Titan and OnlyBot always get a tab; the rest only when
+#
+# always_show: the tab is shown even with no clients; otherwise only when
 # populated. OnlyBot must precede RuneLite: its titles say "RuneLite".
-CLIENT_KINDS = ("DreamBot", "TwiLite", "Titan", "OnlyBot", "RuneLite")
-KIND_KEYWORDS = {
-    "DreamBot": ("dreambot",),
-    "TwiLite":  ("twilite",),
-    "Titan":    ("titan",),
-    "OnlyBot":  ("onlybot",),
-    "RuneLite": ("runelite",),
-}
+class ClientKind:
+    __slots__ = ("name", "keywords", "path_markers", "always_show")
+
+    def __init__(self, name: str, keywords=(), path_markers=(),
+                 always_show: bool = False):
+        self.name = name
+        self.keywords = tuple(k.lower() for k in keywords if k)
+        self.path_markers = tuple(m.lower() for m in path_markers if m)
+        self.always_show = always_show
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "keywords": list(self.keywords),
+                "path_markers": list(self.path_markers),
+                "always_show": self.always_show}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ClientKind":
+        return cls(str(d["name"]), d.get("keywords", ()),
+                   d.get("path_markers", ()), bool(d.get("always_show", False)))
+
+
+DEFAULT_CLIENTS = (
+    ClientKind("DreamBot", ("dreambot",), ("\\dreambot\\",), True),
+    ClientKind("TwiLite",  ("twilite",),  (),                True),
+    ClientKind("Titan",    ("titan",),    (),                True),
+    ClientKind("OnlyBot",  ("onlybot",),  (".onlybot",),     True),
+    ClientKind("RuneLite", ("runelite",), (),                False),
+)
 OTHER_KIND = "Other"
-TITAN_KIND = "Titan"
-ALWAYS_SHOWN_KINDS = ("DreamBot", "TwiLite", "Titan", "OnlyBot")
+TITAN_KIND = "Titan"  # TitanClient tabs keep their special handling by name
+
+# The active list. Read by the Scanner thread, so it is only ever replaced
+# whole (one atomic rebind in set_client_kinds), never mutated in place.
+_client_kinds: tuple[ClientKind, ...] = DEFAULT_CLIENTS
+
+
+def client_kinds() -> tuple[ClientKind, ...]:
+    return _client_kinds
+
+
+def set_client_kinds(kinds) -> None:
+    global _client_kinds
+    _client_kinds = tuple(kinds)
 
 # TitanClient hosts every game client as a *tab* inside one controller
 # window. Each tab is still a separate osclient.exe process, and its real
@@ -163,36 +197,55 @@ NUM_CORES = psutil.cpu_count() or 1
 # ---------------------------------------------------------------------------
 
 def _is_interesting(title: str, keywords=KEYWORDS) -> bool:
+    """Title matches a scan keyword or any client kind's keyword."""
     tl = title.lower()
-    return any(kw in tl for kw in keywords)
+    return (any(kw in tl for kw in keywords)
+            or any(kw in tl for k in _client_kinds for kw in k.keywords))
+
+
+def _launcher_tag(proc_name: str) -> str | None:
+    """The kind name _proc_label appended ("java.exe (OnlyBot)" → "OnlyBot")
+    when it is one of the current kinds' tags, else None."""
+    for k in _client_kinds:
+        if k.path_markers and proc_name.endswith(f" ({k.name})"):
+            return k.name
+    return None
 
 
 def _is_bot_process(proc_name: str) -> bool:
     nl = proc_name.lower()
-    return nl in BOT_PROC_NAMES or any(kw in nl for kw in BOT_PROC_KEYWORDS)
+    return (nl in BOT_PROC_NAMES
+            or any(kw in nl for kw in BOT_PROC_KEYWORDS)
+            or any(kw in nl for k in _client_kinds for kw in k.keywords)
+            or _launcher_tag(proc_name) is not None)
 
 
 def _proc_label(proc: "psutil.Process") -> str:
-    """Process name for the scanner tuple, with the launcher appended when
-    the exe path reveals one (see LAUNCHER_PATH_MARKERS)."""
+    """Process name for the scanner tuple, with the kind appended when the
+    exe path contains one of its path_markers (see ClientKind)."""
     name = proc.name()
     try:
         exe = proc.exe().lower()
     except Exception:  # AccessDenied, ZombieProcess…
         return name
-    for marker, launcher in LAUNCHER_PATH_MARKERS.items():
-        if marker in exe:
-            return f"{name} ({launcher})"
+    for k in _client_kinds:
+        if any(m in exe for m in k.path_markers):
+            return f"{name} ({k.name})"
     return name
 
 
 def _client_kind(title: str, proc_name: str) -> str:
     """Classify a client window for the navigation tabs. `proc_name` may
-    carry a launcher suffix ("java.exe (OnlyBot)") — see _proc_label."""
+    carry a launcher tag ("java.exe (OnlyBot)", see _proc_label), which
+    wins over keywords; otherwise the first kind with a keyword in the
+    title or process name."""
+    tag = _launcher_tag(proc_name)
+    if tag is not None:
+        return tag
     haystack = f"{title} {proc_name}".lower()
-    for kind in CLIENT_KINDS:
-        if any(kw in haystack for kw in KIND_KEYWORDS[kind]):
-            return kind
+    for k in _client_kinds:
+        if any(kw in haystack for kw in k.keywords):
+            return k.name
     return OTHER_KIND
 
 
@@ -1520,6 +1573,7 @@ class BotWall(QMainWindow):
         self._self_proc = psutil.Process()
         self._self_proc.cpu_percent(interval=None)  # prime the baseline
         self._settings = QSettings("BotWall", "BotWall")
+        self._load_client_kinds()  # before _setup_ui: the tabs are built from it
         self._setup_ui()
         self._setup_tray()
         self._start_threads()
@@ -1819,18 +1873,8 @@ class BotWall(QMainWindow):
         tabs_layout.setSpacing(6)
 
         self._tab_buttons: dict[str | None, QPushButton] = {}
-
-        def _make_tab(kind: str | None):
-            b = QPushButton(kind or "All")
-            b.setFixedHeight(26)
-            b.setCursor(QCursor(Qt.PointingHandCursor))
-            b.clicked.connect(lambda _, k=kind: self._set_active_kind(k))
-            tabs_layout.addWidget(b)
-            self._tab_buttons[kind] = b
-
-        _make_tab(None)
-        for kind in (*CLIENT_KINDS, OTHER_KIND):
-            _make_tab(kind)
+        self._tabs_layout = tabs_layout
+        self._build_kind_tabs()
         tabs_layout.addStretch()
 
         # ---- Script filter (DreamBot clients run different scripts) ----
@@ -2057,6 +2101,22 @@ class BotWall(QMainWindow):
             QPushButton:hover {{ color: {TEXT_COLOR}; border-color: {DIM_COLOR}; }}
         """
 
+    def _build_kind_tabs(self):
+        """(Re)create the All + per-kind + Other tab buttons at the front of
+        the tab strip, from the current client kinds list."""
+        for b in self._tab_buttons.values():
+            self._tabs_layout.removeWidget(b)
+            b.deleteLater()
+        self._tab_buttons = {}
+        kinds = (None, *(k.name for k in client_kinds()), OTHER_KIND)
+        for i, kind in enumerate(kinds):
+            b = QPushButton(kind or "All")
+            b.setFixedHeight(26)
+            b.setCursor(QCursor(Qt.PointingHandCursor))
+            b.clicked.connect(lambda _, k=kind: self._set_active_kind(k))
+            self._tabs_layout.insertWidget(i, b)
+            self._tab_buttons[kind] = b
+
     def _set_active_kind(self, kind: str | None):
         self._active_kind = kind
         self._grid_view.set_filter_kind(kind)
@@ -2111,7 +2171,8 @@ class BotWall(QMainWindow):
 
     def _refresh_tabs(self):
         """Update tab labels/counts, highlight the active one, and hide
-        never-populated optional kinds (see ALWAYS_SHOWN_KINDS)."""
+        never-populated optional kinds (see ClientKind.always_show)."""
+        always = {k.name for k in client_kinds() if k.always_show}
         total = sum(self._kind_counts.values())
         for kind, btn in self._tab_buttons.items():
             active = kind == self._active_kind
@@ -2121,7 +2182,7 @@ class BotWall(QMainWindow):
                 count = self._kind_counts.get(kind, 0)
                 btn.setText(f"{kind} ({count})")
                 btn.setVisible(
-                    kind in ALWAYS_SHOWN_KINDS or count > 0 or active
+                    kind in always or count > 0 or active
                 )
             btn.setStyleSheet(self._tab_btn_style(active))
 
@@ -2211,7 +2272,7 @@ class BotWall(QMainWindow):
     def _show_settings(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("BotWall — Settings")
-        dlg.setMinimumWidth(460)
+        dlg.setMinimumWidth(640)
         dlg.setStyleSheet(f"""
             QDialog {{ background: {BG_COLOR}; }}
             QLabel {{ color: {TEXT_COLOR}; font-size: 12px; }}
@@ -2238,13 +2299,148 @@ class BotWall(QMainWindow):
         hint.setStyleSheet(f"color: {DIM_COLOR}; font-size: 11px;")
         form.addRow(hint)
 
+        # ---- Client kinds (one tab each) ----
+        clients_lbl = QLabel("Clients (one tab each; first match wins, top to bottom):")
+        form.addRow(clients_lbl)
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(
+            ["Name", "Keywords", "Exe path contains", "Always show"]
+        )
+        table.horizontalHeaderItem(1).setToolTip(
+            "A window whose title contains one of these is scanned, and its "
+            "process passes the bot-process check if its name contains one. "
+            "Also used to sort the window onto this tab."
+        )
+        table.horizontalHeaderItem(2).setToolTip(
+            "For launchers that run a stock java.exe: if the process exe path "
+            "contains this text, the window goes on this tab no matter what "
+            "its title says (e.g. .onlybot)"
+        )
+        table.horizontalHeaderItem(3).setToolTip(
+            "Show this tab even when no clients of this kind are running"
+        )
+        hdr = table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setMinimumHeight(190)
+        table.setStyleSheet(
+            f"QTableWidget {{ background: {CARD_COLOR}; color: {TEXT_COLOR}; "
+            f"gridline-color: {DIM_COLOR}; font-size: 12px; }}"
+            f"QHeaderView::section {{ background: {TOOLBAR_COLOR}; "
+            f"color: {TEXT_COLOR}; border: none; padding: 3px; }}"
+        )
+
+        def _set_row(row: int, k: ClientKind):
+            table.setItem(row, 0, QTableWidgetItem(k.name))
+            table.setItem(row, 1, QTableWidgetItem(", ".join(k.keywords)))
+            table.setItem(row, 2, QTableWidgetItem(", ".join(k.path_markers)))
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled
+                         | Qt.ItemIsSelectable)
+            chk.setCheckState(Qt.Checked if k.always_show else Qt.Unchecked)
+            table.setItem(row, 3, chk)
+
+        def _load(kinds):
+            table.setRowCount(0)
+            for k in kinds:
+                table.insertRow(table.rowCount())
+                _set_row(table.rowCount() - 1, k)
+
+        def _row_kind(row: int) -> ClientKind:
+            def _txt(col):
+                it = table.item(row, col)
+                return it.text().strip() if it else ""
+            def _list(col):
+                return [w.strip() for w in _txt(col).split(",") if w.strip()]
+            chk = table.item(row, 3)
+            return ClientKind(_txt(0), _list(1), _list(2),
+                              bool(chk and chk.checkState() == Qt.Checked))
+
+        def _add():
+            row = table.rowCount()
+            table.insertRow(row)
+            _set_row(row, ClientKind("", (), (), False))
+            table.setCurrentCell(row, 0)
+            table.editItem(table.item(row, 0))
+
+        def _remove():
+            row = table.currentRow()
+            if row >= 0:
+                table.removeRow(row)
+
+        def _move(delta: int):
+            row = table.currentRow()
+            dest = row + delta
+            if row < 0 or not 0 <= dest < table.rowCount():
+                return
+            a, b = _row_kind(row), _row_kind(dest)
+            _set_row(row, b)
+            _set_row(dest, a)
+            table.setCurrentCell(dest, table.currentColumn())
+
+        _load(client_kinds())
+        form.addRow(table)
+
+        row_btns = QHBoxLayout()
+        for label, slot in (("Add", _add), ("Remove", _remove),
+                            ("Move Up", lambda: _move(-1)),
+                            ("Move Down", lambda: _move(1)),
+                            ("Reset to Defaults", lambda: _load(DEFAULT_CLIENTS))):
+            b = QPushButton(label)
+            b.setStyleSheet(
+                f"QPushButton {{ background: {CARD_COLOR}; color: {TEXT_COLOR}; "
+                f"border: 1px solid {DIM_COLOR}; border-radius: 3px; "
+                f"padding: 3px 10px; font-size: 11px; }}"
+            )
+            b.clicked.connect(slot)
+            row_btns.addWidget(b)
+        row_btns.addStretch()
+        form.addRow(row_btns)
+
+        new_kinds: list[ClientKind] = []
+
+        def _accept():
+            kinds = [_row_kind(r) for r in range(table.rowCount())]
+            kinds = [k for k in kinds if k.name]  # blank rows are dropped
+            seen: set[str] = set()
+            for k in kinds:
+                key = k.name.lower()
+                if key in ("all", OTHER_KIND.lower()):
+                    QMessageBox.warning(dlg, "BotWall",
+                                        f'"{k.name}" is a reserved tab name.')
+                    return
+                if key in seen:
+                    QMessageBox.warning(dlg, "BotWall",
+                                        f'Two clients are named "{k.name}".')
+                    return
+                if not k.keywords and not k.path_markers:
+                    QMessageBox.warning(
+                        dlg, "BotWall",
+                        f'"{k.name}" needs at least one keyword or exe path, '
+                        "or no window can ever match it.")
+                    return
+                seen.add(key)
+            new_kinds[:] = kinds
+            dlg.accept()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dlg.accept)
+        buttons.accepted.connect(_accept)
         buttons.rejected.connect(dlg.reject)
         form.addRow(buttons)
 
         if dlg.exec_() != QDialog.Accepted:
             return
+        old = [k.to_dict() for k in client_kinds()]
+        if [k.to_dict() for k in new_kinds] != old:
+            self._apply_client_kinds(new_kinds)
+            self._log_event(
+                "Clients updated: " + ", ".join(k.name for k in new_kinds)
+            )
         self._scan_keywords = [
             w.strip().lower() for w in kw_edit.text().split(",") if w.strip()
         ] or list(KEYWORDS)
@@ -2458,10 +2654,36 @@ class BotWall(QMainWindow):
         except (TypeError, ValueError):
             pass
         kind = s.value("active_kind", "") or ""
-        if kind in (*CLIENT_KINDS, OTHER_KIND):
+        if kind in (*(k.name for k in client_kinds()), OTHER_KIND):
             self._set_active_kind(kind)
         if s.value("toolbar_collapsed", "false") == "true":
             self._set_toolbar_collapsed(True)
+
+    def _load_client_kinds(self):
+        """Persisted client kinds list (`clients` JSON), else the defaults."""
+        raw = self._settings.value("clients", "")
+        if not raw:
+            return
+        try:
+            kinds = [ClientKind.from_dict(d) for d in json.loads(raw)]
+        except (TypeError, ValueError, KeyError):
+            return  # unreadable: keep the defaults rather than an empty list
+        set_client_kinds(kinds)
+
+    def _apply_client_kinds(self, kinds: list[ClientKind]):
+        """Install an edited kinds list: persist, rebuild the tabs, and
+        re-classify the current clients without waiting for the next scan."""
+        set_client_kinds(kinds)
+        self._settings.setValue(
+            "clients", json.dumps([k.to_dict() for k in kinds])
+        )
+        self._build_kind_tabs()
+        names = {k.name for k in kinds}
+        if self._active_kind not in (None, OTHER_KIND, *names):
+            self._active_kind = None  # its tab was removed
+        if self._clients:
+            self._on_scan(self._clients)
+        self._set_active_kind(self._active_kind)
 
     def _save_nicknames(self):
         self._settings.setValue(
