@@ -1216,6 +1216,7 @@ class GridView(QScrollArea):
 
         self._card_w = CARD_W_DEFAULT
         self._card_h = CARD_H_DEFAULT
+        self._eff_size = (CARD_W_DEFAULT, CARD_H_DEFAULT)  # set by _relayout
 
         self._container = QWidget()
         self._container.setStyleSheet(f"background: {BG_COLOR};")
@@ -1325,8 +1326,14 @@ class GridView(QScrollArea):
             self._show_placeholder()
 
     def update_screenshot(self, hwnd: int, pixmap: QPixmap, age_s: float = 0.0):
-        if hwnd in self._cards:
-            self._cards[hwnd].update_pixmap(pixmap, age_s)
+        card = self._cards.get(hwnd)
+        if card is None:
+            return
+        old = card._pixmap_raw
+        card.update_pixmap(pixmap, age_s)
+        # First frame, or the client window changed shape: re-fit heights
+        if old is None or old.width() * pixmap.height() != old.height() * pixmap.width():
+            self._relayout()
 
     def check_feeds(self):
         """Flag visible cards whose captures have stopped arriving."""
@@ -1475,14 +1482,37 @@ class GridView(QScrollArea):
     # Internal helpers
     # ------------------------------------------------------------------
     def _fix_card_size(self, card: ClientCard):
-        card.setFixedSize(self._card_w, self._card_h)
+        card.setFixedSize(*self._eff_size)
+
+    def _frame_aspect(self, hwnds: list[int]) -> float:
+        """Median w/h of the visible cards' frames; zoom box until one lands."""
+        aspects = sorted(
+            p.width() / p.height() for p in
+            (self._cards[h]._pixmap_raw for h in hwnds)
+            if p is not None and p.height() > 0
+        )
+        if aspects:
+            return aspects[len(aspects) // 2]
+        return self._card_w / max(1, self._card_h - HEADER_H)
 
     def _relayout(self):
-        vp_w = self.viewport().width() - 20  # subtract margins
-        cols = max(1, vp_w // (self._card_w + self._grid.spacing()))
+        # Reserve the scrollbar's 8 px always, so it appearing can't change
+        # the column math and make the layout oscillate.
+        vp_w = self.width() - 20 - 8  # subtract margins + scrollbar
+        sp = self._grid.spacing()
+        cols = max(1, (vp_w + sp) // (self._card_w + sp))
         display_order = self._sorted_order()
 
-        signature = (tuple(display_order), cols, self._card_w, self._card_h)
+        # Zoom sets the target width; cards then stretch to fill the row and
+        # take their height from the frame aspect, so no letterbox bars.
+        w = max(160, (vp_w - sp * (cols - 1)) // cols)
+        h = HEADER_H + round(w / self._frame_aspect(display_order))
+        if (w, h) != self._eff_size:
+            self._eff_size = (w, h)
+            for card in self._cards.values():
+                self._fix_card_size(card)
+
+        signature = (tuple(display_order), cols, w, h)
         if signature == self._last_layout:
             return  # nothing moved — skip the remove/re-add churn
         self._last_layout = signature

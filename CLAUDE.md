@@ -76,7 +76,7 @@ BotWall (QMainWindow)
 - Pin button (📌) moves card to the front of the grid (pinned hwnds come first in `_sorted_order()`).
 
 **Grid layout:**
-Column count is computed dynamically: `cols = viewport_width // (card_w + spacing)`. Ctrl+Scroll calls `GridView.zoom()` which clamps minimum card size to 160×110 px.
+Zoom (`_card_w`) is the *target* width: `cols = (avail + spacing) // (card_w + spacing)`, then `_relayout()` stretches cards to fill the row exactly and sets height = `HEADER_H` + width / the median frame aspect of the visible cards (`_frame_aspect`; falls back to the zoom box until frames arrive), stored in `_eff_size`. That removes the letterbox bars and the right-edge gap. The width math always reserves the 8 px scrollbar so its appearance can't make the layout oscillate. `update_screenshot` re-runs `_relayout` when a card gets its first frame or its frame aspect changes. Ctrl+Scroll calls `GridView.zoom()` which clamps minimum card size to 160×110 px.
 
 **Low CPU mode:**
 Sets capture interval to 1 s and converts each frame to grayscale (`QImage.Format_Grayscale8`) with `Qt.FastTransformation` scaling instead of smooth.
