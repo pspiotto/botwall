@@ -1347,8 +1347,14 @@ class GridView(QScrollArea):
             card.set_hidden_tab(hwnd in hwnds)
 
     def zoom(self, factor: float):
-        self._card_w = max(160, min(1600, int(self._card_w * factor)))
-        self._card_h = max(110, min(1100, int(self._card_h * factor)))
+        # Step one column per zoom, not a % of width: cards only change size
+        # when the column count does, so a % step needed several clicks.
+        vp_w, sp = self._avail_width()
+        cols = max(1, (vp_w + sp) // (self._card_w + sp))
+        cols = max(1, cols - 1 if factor > 1 else cols + 1)
+        new_w = max(160, min(1600, (vp_w - sp * (cols - 1)) // cols))
+        self._card_h = max(110, min(1100, round(self._card_h * new_w / self._card_w)))
+        self._card_w = new_w
         for card in self._cards.values():
             self._fix_card_size(card)
         self._relayout()
@@ -1495,11 +1501,13 @@ class GridView(QScrollArea):
             return aspects[len(aspects) // 2]
         return self._card_w / max(1, self._card_h - HEADER_H)
 
-    def _relayout(self):
+    def _avail_width(self) -> tuple[int, int]:
         # Reserve the scrollbar's 8 px always, so it appearing can't change
         # the column math and make the layout oscillate.
-        vp_w = self.width() - 20 - 8  # subtract margins + scrollbar
-        sp = self._grid.spacing()
+        return self.width() - 20 - 8, self._grid.spacing()  # minus margins + scrollbar
+
+    def _relayout(self):
+        vp_w, sp = self._avail_width()
         cols = max(1, (vp_w + sp) // (self._card_w + sp))
         display_order = self._sorted_order()
 
