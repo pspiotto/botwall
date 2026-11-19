@@ -446,6 +446,7 @@ class Scanner(QThread):
                 return pid_stats[pid]
 
             titan_ctrls: list[int] = []
+            path_tagged: dict[int, bool] = {}  # pid -> exe path has a marker (per scan)
 
             def _cb(hwnd, _):
                 if not win32gui.IsWindowVisible(hwnd):
@@ -457,10 +458,18 @@ class Scanner(QThread):
                 except Exception:
                     pass
                 title = win32gui.GetWindowText(hwnd)
-                if not title or not _is_interesting(title, self._keywords):
+                if not title:
                     return
                 try:
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    # A path-marker kind is detected by exe path alone: an
+                    # emulator window is titled with the instance name.
+                    if not _is_interesting(title, self._keywords):
+                        if pid not in path_tagged:
+                            path_tagged[pid] = _launcher_tag(
+                                _proc_label(psutil.Process(pid))) is not None
+                        if not path_tagged[pid]:
+                            return
                     proc_name, cpu_pct, mem_mb, uptime_s = stats_for(pid)
                 except Exception:
                     return

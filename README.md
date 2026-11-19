@@ -44,6 +44,8 @@ python botwall.py
 
 BotWall will automatically detect visible windows with "dreambot", "twilite", "runescape", or "runelite" in the title (configurable in ⚙ settings) and begin capturing screenshots. Each client is classified as DreamBot, TwiLite, Titan, OnlyBot (a RuneLite client launched from OnlyBot's `.onlybot` install), RuneLite, or Other, and the tab bar under the toolbar filters the wall by type.
 
+Client types are editable in ⚙ settings > Clients. A type with an "Exe path contains" marker matches any window of a process whose exe path contains it, whatever the window title. Use that for Android emulators, which title the window with the instance name: for MuMuPlayer, set the marker to `mumunxdevice` and leave `mumu` out of the keywords (it would also match MuMu's instance manager window, which captures black).
+
 ### Controls
 
 | Action | How |
